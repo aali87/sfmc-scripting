@@ -1,0 +1,419 @@
+/**
+ * SFMC REST API Client
+ * Handles REST API requests for Automations, Journeys, and other REST-only endpoints
+ */
+
+import axios from 'axios';
+import { getAccessToken } from './sfmc-auth.js';
+import config from '../config/index.js';
+
+// Retry configuration
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1000;
+
+/**
+ * Sleep helper for rate limiting and retries
+ * @param {number} ms - Milliseconds to sleep
+ */
+async function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Create axios instance with auth headers
+ * @param {object} logger - Logger instance
+ * @returns {Promise<axios.AxiosInstance>} Configured axios instance
+ */
+async function createApiClient(logger = null) {
+  const tokenInfo = await getAccessToken(logger);
+
+  return axios.create({
+    baseURL: tokenInfo.restInstanceUrl || config.sfmc.restUrl,
+    headers: {
+      'Authorization': `Bearer ${tokenInfo.accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    timeout: 60000
+  });
+}
+
+/**
+ * Make REST API request with retry logic
+ * @param {string} method - HTTP method
+ * @param {string} endpoint - API endpoint
+ * @param {object} data - Request body (for POST/PUT)
+ * @param {object} params - Query parameters
+ * @param {object} logger - Logger instance
+ * @param {number} retryCount - Current retry count
+ * @returns {Promise<object>} API response data
+ */
+async function makeRequest(method, endpoint, data = null, params = null, logger = null, retryCount = 0) {
+  const client = await createApiClient(logger);
+
+  if (logger) {
+    logger.api(method.toUpperCase(), endpoint, { params });
+  }
+
+  try {
+    const response = await client.request({
+      method,
+      url: endpoint,
+      data,
+      params
+    });
+
+    // Rate limit delay
+    await sleep(config.safety.apiRateLimitDelayMs);
+
+    return response.data;
+
+  } catch (error) {
+    // Handle retryable errors
+    if (retryCount < MAX_RETRIES) {
+      const isRetryable =
+        error.code === 'ETIMEDOUT' ||
+        error.code === 'ECONNRESET' ||
+        (error.response && error.response.status === 503) ||
+        (error.response && error.response.status === 429);
+
+      if (isRetryable) {
+        let delay = RETRY_DELAY_MS * Math.pow(2, retryCount);
+
+        // Check for Retry-After header
+        if (error.response && error.response.headers['retry-after']) {
+          delay = parseInt(error.response.headers['retry-after'], 10) * 1000;
+        }
+
+        if (logger) {
+          logger.warn(`Request failed, retrying in ${delay}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`);
+        }
+
+        await sleep(delay);
+        return makeRequest(method, endpoint, data, params, logger, retryCount + 1);
+      }
+    }
+
+    // Extract error message
+    const errorMessage = extractErrorMessage(error);
+    throw new Error(`REST API error [${method.toUpperCase()} ${endpoint}]: ${errorMessage}`);
+  }
+}
+
+/**
+ * Extract meaningful error message from axios error
+ * @param {Error} error - Axios error object
+ * @returns {string} Human-readable error message
+ */
+function extractErrorMessage(error) {
+  if (error.response) {
+    const data = error.response.data;
+    if (data) {
+      if (typeof data === 'string') {
+        return data;
+      }
+      if (data.message) {
+        return data.message;
+      }
+      if (data.error) {
+        return typeof data.error === 'string' ? data.error : JSON.stringify(data.error);
+      }
+      if (data.errors && Array.isArray(data.errors)) {
+        return data.errors.map(e => e.message || e).join('; ');
+      }
+      return JSON.stringify(data);
+    }
+    return `HTTP ${error.response.status}: ${error.response.statusText}`;
+  }
+
+  if (error.request) {
+    if (error.code === 'ECONNREFUSED') {
+      return 'Connection refused. Check SFMC URL configuration.';
+    }
+    if (error.code === 'ENOTFOUND') {
+      return 'Host not found. Check SFMC subdomain configuration.';
+    }
+    if (error.code === 'ETIMEDOUT') {
+      return 'Request timed out.';
+    }
+    return `Network error: ${error.code || 'No response'}`;
+  }
+
+  return error.message || 'Unknown error';
+}
+
+/**
+ * Get all pages of a paginated endpoint
+ * @param {string} endpoint - API endpoint
+ * @param {string} itemsKey - Key containing items in response
+ * @param {object} params - Additional query parameters
+ * @param {object} logger - Logger instance
+ * @returns {Promise<object[]>} All items across all pages
+ */
+async function getAllPages(endpoint, itemsKey, params = {}, logger = null) {
+  const allItems = [];
+  let page = 1;
+  let hasMore = true;
+
+  while (hasMore) {
+    const pageParams = {
+      ...params,
+      $page: page,
+      $pageSize: 500
+    };
+
+    const response = await makeRequest('get', endpoint, null, pageParams, logger);
+
+    // Handle different response formats
+    let items = [];
+    if (response[itemsKey] && Array.isArray(response[itemsKey])) {
+      items = response[itemsKey];
+    } else if (Array.isArray(response.items)) {
+      items = response.items;
+    } else if (Array.isArray(response)) {
+      items = response;
+    }
+
+    allItems.push(...items);
+
+    // Check for more pages
+    if (response.page && response.pageSize && response.count) {
+      hasMore = (response.page * response.pageSize) < response.count;
+    } else if (items.length === 0) {
+      hasMore = false;
+    } else if (items.length < (pageParams.$pageSize || 500)) {
+      hasMore = false;
+    }
+
+    page++;
+
+    if (logger) {
+      logger.debug(`Fetched page ${page - 1}: ${items.length} items (total: ${allItems.length})`);
+    }
+  }
+
+  return allItems;
+}
+
+// =============================================================================
+// Automation Studio APIs
+// =============================================================================
+
+/**
+ * Get all automations
+ * @param {object} logger - Logger instance
+ * @returns {Promise<object[]>} Array of automation objects
+ */
+export async function getAutomations(logger = null) {
+  try {
+    const automations = await getAllPages('/automation/v1/automations', 'items', {}, logger);
+
+    if (logger) {
+      logger.debug(`Retrieved ${automations.length} automations`);
+    }
+
+    return automations;
+  } catch (error) {
+    if (logger) {
+      logger.error(`Failed to retrieve automations: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Get automation details by ID
+ * @param {string} automationId - Automation ID
+ * @param {object} logger - Logger instance
+ * @returns {Promise<object>} Automation details
+ */
+export async function getAutomationDetails(automationId, logger = null) {
+  return makeRequest('get', `/automation/v1/automations/${automationId}`, null, null, logger);
+}
+
+// =============================================================================
+// Journey Builder APIs
+// =============================================================================
+
+/**
+ * Get all journeys
+ * @param {object} logger - Logger instance
+ * @returns {Promise<object[]>} Array of journey objects
+ */
+export async function getJourneys(logger = null) {
+  try {
+    // Journey API uses different pagination
+    const allJourneys = [];
+    let page = 1;
+    let hasMore = true;
+
+    while (hasMore) {
+      const response = await makeRequest('get', '/interaction/v1/interactions', null, {
+        $page: page,
+        $pageSize: 100
+      }, logger);
+
+      const items = response.items || [];
+      allJourneys.push(...items);
+
+      hasMore = items.length === 100;
+      page++;
+    }
+
+    if (logger) {
+      logger.debug(`Retrieved ${allJourneys.length} journeys`);
+    }
+
+    return allJourneys;
+  } catch (error) {
+    if (logger) {
+      logger.error(`Failed to retrieve journeys: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Get journey details by ID
+ * @param {string} journeyId - Journey ID
+ * @param {object} logger - Logger instance
+ * @returns {Promise<object>} Journey details
+ */
+export async function getJourneyDetails(journeyId, logger = null) {
+  return makeRequest('get', `/interaction/v1/interactions/${journeyId}`, null, null, logger);
+}
+
+// =============================================================================
+// Data Extension Row Count API
+// =============================================================================
+
+/**
+ * Get row count for a Data Extension
+ * @param {string} deKey - Data Extension CustomerKey
+ * @param {object} logger - Logger instance
+ * @returns {Promise<number>} Row count
+ */
+export async function getDataExtensionRowCount(deKey, logger = null) {
+  try {
+    // Use the rowset endpoint with count
+    const response = await makeRequest('get', `/data/v1/customobjectdata/key/${encodeURIComponent(deKey)}/rowset`, null, {
+      $pageSize: 1
+    }, logger);
+
+    // The count is in the response
+    return response.count || 0;
+  } catch (error) {
+    // If DE doesn't exist or no access, return 0
+    if (error.message.includes('404') || error.message.includes('Not Found')) {
+      return 0;
+    }
+
+    // Try alternative method using data extension endpoint
+    try {
+      const response = await makeRequest('get', `/data/v1/customobjectdata/key/${encodeURIComponent(deKey)}`, null, null, logger);
+      return response.count || 0;
+    } catch (altError) {
+      if (logger) {
+        logger.debug(`Could not get row count for ${deKey}: ${altError.message}`);
+      }
+      return null; // null indicates count unavailable
+    }
+  }
+}
+
+// =============================================================================
+// Filter Activity APIs
+// =============================================================================
+
+/**
+ * Get all filter activities
+ * @param {object} logger - Logger instance
+ * @returns {Promise<object[]>} Array of filter activity objects
+ */
+export async function getFilterActivities(logger = null) {
+  try {
+    const filters = await getAllPages('/automation/v1/filters', 'items', {}, logger);
+
+    if (logger) {
+      logger.debug(`Retrieved ${filters.length} filter activities`);
+    }
+
+    return filters;
+  } catch (error) {
+    if (logger) {
+      logger.debug(`Failed to retrieve filter activities: ${error.message}`);
+    }
+    return []; // Filters may not be accessible, return empty
+  }
+}
+
+// =============================================================================
+// Data Extract APIs
+// =============================================================================
+
+/**
+ * Get all data extract activities
+ * @param {object} logger - Logger instance
+ * @returns {Promise<object[]>} Array of data extract objects
+ */
+export async function getDataExtracts(logger = null) {
+  try {
+    const extracts = await getAllPages('/automation/v1/dataextracts', 'items', {}, logger);
+
+    if (logger) {
+      logger.debug(`Retrieved ${extracts.length} data extract activities`);
+    }
+
+    return extracts;
+  } catch (error) {
+    if (logger) {
+      logger.debug(`Failed to retrieve data extracts: ${error.message}`);
+    }
+    return [];
+  }
+}
+
+// =============================================================================
+// Webhook Helper
+// =============================================================================
+
+/**
+ * Send webhook notification
+ * @param {string} url - Webhook URL
+ * @param {object} payload - Data to send
+ * @param {object} logger - Logger instance
+ * @returns {Promise<boolean>} Success status
+ */
+export async function sendWebhook(url, payload, logger = null) {
+  if (!url) {
+    return false;
+  }
+
+  try {
+    await axios.post(url, payload, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+
+    if (logger) {
+      logger.debug('Webhook notification sent successfully');
+    }
+
+    return true;
+  } catch (error) {
+    if (logger) {
+      logger.warn(`Webhook notification failed: ${error.message}`);
+    }
+    return false;
+  }
+}
+
+export default {
+  getAutomations,
+  getAutomationDetails,
+  getJourneys,
+  getJourneyDetails,
+  getDataExtensionRowCount,
+  getFilterActivities,
+  getDataExtracts,
+  sendWebhook
+};

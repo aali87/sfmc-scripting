@@ -1,0 +1,37 @@
+{
+  "name": "sfmc-de-toolkit",
+  "version": "1.0.0",
+  "description": "Comprehensive toolkit for Salesforce Marketing Cloud Data Extension audit, dependency analysis, and safe deletion",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "audit": "node src/scripts/audit-folder.js",
+    "delete-des": "node src/scripts/delete-data-extensions.js",
+    "delete-folders": "node src/scripts/delete-folders.js",
+    "start": "node src/index.js"
+  },
+  "keywords": [
+    "salesforce",
+    "marketing-cloud",
+    "sfmc",
+    "data-extension",
+    "audit",
+    "cleanup"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.2",
+    "chalk": "^5.3.0",
+    "dayjs": "^1.11.10",
+    "dotenv": "^16.3.1",
+    "inquirer": "^9.2.12",
+    "ora": "^8.0.1",
+    "winston": "^3.11.0",
+    "xml2js": "^0.6.2",
+    "yargs": "^17.7.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
