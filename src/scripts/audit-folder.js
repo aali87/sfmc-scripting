@@ -23,7 +23,7 @@ import dayjs from 'dayjs';
 import config, { validateConfig, isFolderProtected, isDeProtected } from '../config/index.js';
 import { createLogger, createAuditLogger } from '../lib/logger.js';
 import { testConnection } from '../lib/sfmc-auth.js';
-import { getFolderByPath, getFolderByName, getSubfolders, getFolderTree, findSimilarFolders } from '../lib/folder-service.js';
+import { getFolderByPath, getFolderByName, getSubfolders, getFolderTree, findSimilarFolders, clearFolderCache } from '../lib/folder-service.js';
 import { getDataExtensionsInFolder, getFullDataExtensionDetails } from '../lib/data-extension-service.js';
 import { batchCheckDependencies } from '../lib/dependency-service.js';
 
@@ -59,6 +59,11 @@ const argv = yargs(hideBin(process.argv))
     describe: 'Maximum subfolder depth to traverse',
     type: 'number',
     default: -1 // Unlimited
+  })
+  .option('refresh-cache', {
+    describe: 'Force refresh folder cache from SFMC API',
+    type: 'boolean',
+    default: false
   })
   .help()
   .alias('help', 'h')
@@ -315,6 +320,13 @@ async function runAudit() {
     }
 
     spinner.succeed('Connected to SFMC');
+
+    // Handle cache refresh if requested
+    if (argv.refreshCache) {
+      spinner.start('Clearing cache and fetching fresh data from SFMC...');
+      await clearFolderCache(logger);
+      spinner.succeed('Cache cleared - will fetch fresh data');
+    }
 
     // Find target folder
     spinner.start('Finding target folder...');

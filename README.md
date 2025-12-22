@@ -96,6 +96,31 @@ npm start test
 node src/index.js test
 ```
 
+### Sync Folder Structure (Cache Management)
+
+The toolkit caches folder structure locally to reduce API calls. On first run, it fetches all folders from SFMC and caches them. Subsequent operations use this cache (valid for 24 hours).
+
+```bash
+# Sync/refresh folder cache from SFMC
+node src/index.js sync
+
+# Check cache status
+node src/index.js sync --status
+
+# Clear cache without refreshing
+node src/index.js sync --clear
+```
+
+To force a fresh fetch during any operation, use `--refresh-cache`:
+
+```bash
+# Audit with fresh data from SFMC
+node src/scripts/audit-folder.js --folder "Data Extensions/Archive" --refresh-cache
+
+# Delete with fresh data
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" --refresh-cache
+```
+
 ### Audit a Folder (Read-Only)
 
 Generate a comprehensive report without making any changes:
@@ -125,6 +150,7 @@ node src/scripts/audit-folder.js --folder "Data Extensions/Archive" --include-ro
 | `--check-dependencies, -d` | Run dependency checks | true |
 | `--include-row-counts, -r` | Include record counts | true |
 | `--max-depth` | Maximum subfolder depth | unlimited |
+| `--refresh-cache` | Force refresh cache from SFMC API | false |
 
 ### Delete Data Extensions
 
@@ -165,6 +191,7 @@ node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" --
 | `--exclude-pattern` | Regex pattern to exclude | - |
 | `--include-pattern` | Regex pattern to include | - |
 | `--batch-size` | DEs per batch | 10 |
+| `--refresh-cache` | Force refresh cache from SFMC API | false |
 
 ### Delete Folders
 
@@ -189,6 +216,7 @@ node src/scripts/delete-folders.js --folder "Data Extensions/Archive" --force --
 | `--confirm` | Enable actual deletion | false |
 | `--force` | Delete contents before folders | false |
 | `--skip-protected` | Skip protected folders vs abort | false |
+| `--refresh-cache` | Force refresh cache from SFMC API | false |
 
 ## Safety Features
 

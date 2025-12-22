@@ -24,7 +24,7 @@ import dayjs from 'dayjs';
 import config, { validateConfig, isDeProtected } from '../config/index.js';
 import { createLogger, createAuditLogger, createStateManager } from '../lib/logger.js';
 import { testConnection } from '../lib/sfmc-auth.js';
-import { getFolderByPath, getFolderByName, getSubfolders, findSimilarFolders } from '../lib/folder-service.js';
+import { getFolderByPath, getFolderByName, getSubfolders, findSimilarFolders, clearFolderCache } from '../lib/folder-service.js';
 import {
   getDataExtensionsInFolder,
   getFullDataExtensionDetails,
@@ -115,6 +115,11 @@ const argv = yargs(hideBin(process.argv))
   .option('webhook-url', {
     describe: 'URL to POST results to when complete',
     type: 'string'
+  })
+  .option('refresh-cache', {
+    describe: 'Force refresh folder cache from SFMC API',
+    type: 'boolean',
+    default: false
   })
   .check((argv) => {
     // If --confirm is used, dry-run should be false
@@ -381,6 +386,13 @@ async function runDeletion() {
     }
 
     spinner.succeed('Connected to SFMC');
+
+    // Handle cache refresh if requested
+    if (argv.refreshCache) {
+      spinner.start('Clearing cache and fetching fresh data from SFMC...');
+      await clearFolderCache(logger);
+      spinner.succeed('Cache cleared - will fetch fresh data');
+    }
 
     // Find target folder
     spinner.start('Finding target folder...');

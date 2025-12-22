@@ -29,7 +29,8 @@ import {
   getDeletionOrder,
   isFolderEmpty,
   deleteFolder,
-  findSimilarFolders
+  findSimilarFolders,
+  clearFolderCache
 } from '../lib/folder-service.js';
 import { getDataExtensionsInFolder, deleteDataExtension } from '../lib/data-extension-service.js';
 import { sendWebhook } from '../lib/sfmc-rest.js';
@@ -75,6 +76,11 @@ const argv = yargs(hideBin(process.argv))
   .option('webhook-url', {
     describe: 'URL to POST results to when complete',
     type: 'string'
+  })
+  .option('refresh-cache', {
+    describe: 'Force refresh folder cache from SFMC API',
+    type: 'boolean',
+    default: false
   })
   .check((argv) => {
     if (argv.confirm) {
@@ -274,6 +280,13 @@ async function runDeletion() {
     }
 
     spinner.succeed('Connected to SFMC');
+
+    // Handle cache refresh if requested
+    if (argv.refreshCache) {
+      spinner.start('Clearing cache and fetching fresh data from SFMC...');
+      await clearFolderCache(logger);
+      spinner.succeed('Cache cleared - will fetch fresh data');
+    }
 
     // Find target folder
     spinner.start('Finding target folder...');

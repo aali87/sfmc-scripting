@@ -16,6 +16,7 @@ import { fileURLToPath } from 'url';
 
 import config from './config/index.js';
 import { testConnection } from './lib/sfmc-auth.js';
+import { clearFolderCache, getFolderCacheStatus, getFolderByPath } from './lib/folder-service.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -84,14 +85,21 @@ const cli = yargs(hideBin(process.argv))
           type: 'boolean',
           default: true
         })
+        .option('refresh-cache', {
+          describe: 'Force refresh folder/DE cache from SFMC API',
+          type: 'boolean',
+          default: false
+        })
         .example('$0 audit -f "Archive/Old Campaigns"', 'Audit the specified folder')
-        .example('$0 audit -f "Archive" -o json', 'Audit and output JSON only');
+        .example('$0 audit -f "Archive" -o json', 'Audit and output JSON only')
+        .example('$0 audit -f "Archive" --refresh-cache', 'Audit with fresh data from API');
     },
     (argv) => {
       const args = ['--folder', argv.folder];
       if (argv.output) args.push('--output', argv.output);
       if (!argv.checkDependencies) args.push('--check-dependencies', 'false');
       if (!argv.includeRowCounts) args.push('--include-row-counts', 'false');
+      if (argv.refreshCache) args.push('--refresh-cache');
       runScript('audit-folder', args);
     }
   )
@@ -138,6 +146,11 @@ const cli = yargs(hideBin(process.argv))
           type: 'number',
           default: 10
         })
+        .option('refresh-cache', {
+          describe: 'Force refresh folder/DE cache from SFMC API',
+          type: 'boolean',
+          default: false
+        })
         .example('$0 delete-des -f "Archive"', 'Dry run - preview what would be deleted')
         .example('$0 delete-des -f "Archive" --confirm', 'Actually delete DEs')
         .example('$0 delete-des -f "Archive" -i', 'Interactive selection mode');
@@ -150,6 +163,7 @@ const cli = yargs(hideBin(process.argv))
       if (argv.skipProtected) args.push('--skip-protected');
       if (argv.olderThanDays) args.push('--older-than-days', argv.olderThanDays);
       if (argv.batchSize) args.push('--batch-size', argv.batchSize);
+      if (argv.refreshCache) args.push('--refresh-cache');
       runScript('delete-data-extensions', args);
     }
   )
@@ -181,6 +195,11 @@ const cli = yargs(hideBin(process.argv))
           type: 'boolean',
           default: false
         })
+        .option('refresh-cache', {
+          describe: 'Force refresh folder/DE cache from SFMC API',
+          type: 'boolean',
+          default: false
+        })
         .example('$0 delete-folders -f "Archive"', 'Dry run - preview folder deletion')
         .example('$0 delete-folders -f "Archive" --confirm', 'Actually delete folders')
         .example('$0 delete-folders -f "Archive" --force --confirm', 'Delete folders and contents');
@@ -190,6 +209,7 @@ const cli = yargs(hideBin(process.argv))
       if (argv.confirm) args.push('--confirm');
       if (argv.force) args.push('--force');
       if (argv.skipProtected) args.push('--skip-protected');
+      if (argv.refreshCache) args.push('--refresh-cache');
       runScript('delete-folders', args);
     }
   )
@@ -222,6 +242,95 @@ const cli = yargs(hideBin(process.argv))
         }
       } catch (error) {
         console.log(chalk.red('✗ Connection failed!\n'));
+        console.log(`  Error: ${error.message}`);
+        process.exit(1);
+      }
+    }
+  )
+
+  // Sync/cache command
+  .command(
+    'sync',
+    'Sync folder structure from SFMC (refresh cache)',
+    (yargs) => {
+      return yargs
+        .option('clear', {
+          describe: 'Clear cache without refreshing',
+          type: 'boolean',
+          default: false
+        })
+        .option('status', {
+          describe: 'Show cache status only',
+          type: 'boolean',
+          default: false
+        })
+        .example('$0 sync', 'Refresh folder cache from SFMC')
+        .example('$0 sync --status', 'Show cache status')
+        .example('$0 sync --clear', 'Clear cache');
+    },
+    async (argv) => {
+      printBanner();
+
+      if (argv.status) {
+        // Show cache status
+        console.log('Cache Status:\n');
+        const status = await getFolderCacheStatus();
+
+        if (status.exists) {
+          console.log(chalk.green('  Folder cache: Available'));
+          console.log(`    Cached at: ${status.cachedAt}`);
+          console.log(`    Age: ${status.ageString}`);
+          console.log(`    Items: ${status.itemCount} folders`);
+          console.log(`    File: ${status.filePath}`);
+        } else {
+          console.log(chalk.yellow('  Folder cache: Not found'));
+          console.log('  Run "sync" to fetch folder structure from SFMC');
+        }
+        return;
+      }
+
+      if (argv.clear) {
+        // Clear cache
+        console.log('Clearing cache...\n');
+        const cleared = await clearFolderCache();
+        if (cleared) {
+          console.log(chalk.green('✓ Cache cleared successfully'));
+        } else {
+          console.log(chalk.yellow('No cache to clear'));
+        }
+        return;
+      }
+
+      // Sync (refresh cache)
+      console.log('Syncing folder structure from SFMC...\n');
+      console.log(chalk.gray('This fetches all Data Extension folders and caches them locally.'));
+      console.log(chalk.gray('Subsequent operations will use this cache for faster performance.\n'));
+
+      try {
+        // Clear existing cache first
+        await clearFolderCache();
+
+        // Force a fresh load by calling getFolderByPath with forceRefresh
+        // We use a dummy path just to trigger the cache refresh
+        const startTime = Date.now();
+
+        // Import the loadAllFolders indirectly by using a folder lookup
+        // This will populate the cache
+        await getFolderByPath('Data Extensions', { info: console.log, debug: () => {}, warn: console.warn, error: console.error, api: () => {} });
+
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+        // Get updated status
+        const status = await getFolderCacheStatus();
+
+        console.log('');
+        console.log(chalk.green(`✓ Sync complete! (${elapsed}s)`));
+        console.log(`  Cached ${status.itemCount} folders`);
+        console.log(chalk.gray(`  Cache will be used for future operations`));
+        console.log(chalk.gray(`  Use --refresh-cache flag to force re-sync`));
+
+      } catch (error) {
+        console.log(chalk.red('✗ Sync failed!\n'));
         console.log(`  Error: ${error.message}`);
         process.exit(1);
       }

@@ -12,6 +12,7 @@ audit/
 backup/
 state/
 undo/
+cache/
 
 # Log files
 *.log

@@ -1,6 +1,7 @@
 /**
  * Folder Service
  * Operations for working with SFMC Data Extension folders
+ * Supports persistent file-based caching to reduce API calls
  */
 
 import {
@@ -9,43 +10,87 @@ import {
   buildSimpleFilter
 } from './sfmc-soap.js';
 import { isFolderProtected } from '../config/index.js';
+import { readCache, writeCache, clearCache, getCacheInfo } from './cache.js';
+import config from '../config/index.js';
 
-// Cache for folder data to reduce API calls
-let folderCache = {
+// Cache type identifier
+const FOLDER_CACHE_TYPE = 'folders';
+
+// Default cache expiry: 24 hours (can be overridden or ignored)
+const DEFAULT_CACHE_EXPIRY_MS = 24 * 60 * 60 * 1000;
+
+// In-memory cache for current session (faster than file reads)
+let memoryCache = {
   folders: null,
   loadedAt: null
 };
 
-// Cache TTL in milliseconds (5 minutes)
-const CACHE_TTL = 5 * 60 * 1000;
-
 /**
- * Clear the folder cache
+ * Clear both in-memory and file-based cache
+ * @param {object} logger - Logger instance
+ * @returns {Promise<boolean>} True if cleared
  */
-export function clearFolderCache() {
-  folderCache = { folders: null, loadedAt: null };
+export async function clearFolderCache(logger = null) {
+  memoryCache = { folders: null, loadedAt: null };
+  const cleared = await clearCache(FOLDER_CACHE_TYPE, config.sfmc.accountId);
+  if (logger && cleared) {
+    logger.info('Folder cache cleared');
+  }
+  return cleared;
 }
 
 /**
- * Load all folders (with caching)
+ * Get cache status information
+ * @returns {Promise<object>} Cache info
+ */
+export async function getFolderCacheStatus() {
+  return getCacheInfo(FOLDER_CACHE_TYPE, config.sfmc.accountId);
+}
+
+/**
+ * Load all folders (with persistent file caching)
  * @param {object} logger - Logger instance
- * @param {boolean} forceRefresh - Force cache refresh
+ * @param {boolean} forceRefresh - Force cache refresh (--refresh-cache flag)
  * @returns {Promise<object[]>} Array of folder objects
  */
 async function loadAllFolders(logger = null, forceRefresh = false) {
   const now = Date.now();
+  const accountId = config.sfmc.accountId;
 
-  if (!forceRefresh && folderCache.folders && folderCache.loadedAt) {
-    if (now - folderCache.loadedAt < CACHE_TTL) {
+  // Check in-memory cache first (fastest)
+  if (!forceRefresh && memoryCache.folders && memoryCache.loadedAt) {
+    if (logger) {
+      logger.debug('Using in-memory folder cache');
+    }
+    return memoryCache.folders;
+  }
+
+  // Check file cache (unless force refresh)
+  if (!forceRefresh) {
+    const cached = await readCache(FOLDER_CACHE_TYPE, accountId, {
+      maxAgeMs: DEFAULT_CACHE_EXPIRY_MS,
+      ignoreExpiry: false
+    });
+
+    if (cached && cached.data) {
+      const info = await getCacheInfo(FOLDER_CACHE_TYPE, accountId);
       if (logger) {
-        logger.debug('Using cached folder data');
+        logger.info(`Using cached folder data (${info.ageString}, ${cached.data.length} folders)`);
       }
-      return folderCache.folders;
+
+      // Store in memory cache for this session
+      memoryCache = {
+        folders: cached.data,
+        loadedAt: now
+      };
+
+      return cached.data;
     }
   }
 
+  // Fetch from SFMC API
   if (logger) {
-    logger.debug('Loading all folders from SFMC...');
+    logger.info('Fetching folder structure from SFMC API (this may take a moment)...');
   }
 
   // Filter to only get dataextension content type folders
@@ -70,14 +115,19 @@ async function loadAllFolders(logger = null, forceRefresh = false) {
     isProtected: isFolderProtected(f.Name)
   }));
 
-  // Update cache
-  folderCache = {
+  // Save to file cache
+  await writeCache(FOLDER_CACHE_TYPE, accountId, normalizedFolders, {
+    folderCount: normalizedFolders.length
+  });
+
+  // Update in-memory cache
+  memoryCache = {
     folders: normalizedFolders,
     loadedAt: now
   };
 
   if (logger) {
-    logger.debug(`Loaded ${normalizedFolders.length} folders`);
+    logger.info(`Cached ${normalizedFolders.length} folders (cache will be used for future operations)`);
   }
 
   return normalizedFolders;
@@ -396,6 +446,7 @@ export async function findSimilarFolders(name, logger = null) {
 
 export default {
   clearFolderCache,
+  getFolderCacheStatus,
   getFolderByPath,
   getFolderByName,
   getFolderById,
