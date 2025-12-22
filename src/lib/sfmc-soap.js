@@ -81,7 +81,7 @@ async function parseSoapResponse(xmlResponse) {
  * @param {number} retryCount - Current retry count
  * @returns {Promise<object>} Parsed response body
  */
-async function makeSoapRequest(soapBody, logger, retryCount = 0) {
+async function makeSoapRequest(soapBody, logger, retryCount = 0, soapAction = 'Retrieve') {
   const tokenInfo = await getAccessToken(logger);
   const envelope = buildSoapEnvelope(tokenInfo.accessToken, soapBody);
 
@@ -92,14 +92,14 @@ async function makeSoapRequest(soapBody, logger, retryCount = 0) {
   }
 
   if (logger) {
-    logger.api('POST', soapUrl, { bodyLength: soapBody.length });
+    logger.api('POST', soapUrl, { bodyLength: soapBody.length, action: soapAction });
   }
 
   try {
     const response = await axios.post(soapUrl, envelope, {
       headers: {
         'Content-Type': 'text/xml; charset=utf-8',
-        'SOAPAction': 'Retrieve'
+        'SOAPAction': soapAction
       },
       timeout: 120000 // 2 minute timeout for SOAP calls
     });
@@ -124,7 +124,7 @@ async function makeSoapRequest(soapBody, logger, retryCount = 0) {
           logger.warn(`Request failed, retrying in ${delay}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`);
         }
         await sleep(delay);
-        return makeSoapRequest(soapBody, logger, retryCount + 1);
+        return makeSoapRequest(soapBody, logger, retryCount + 1, soapAction);
       }
     }
 
@@ -222,7 +222,9 @@ export async function retrieve(objectType, properties, filter = null, logger = n
       // Continue retrieving with requestId
       soapBody = `
         <RetrieveRequestMsg xmlns="${NAMESPACES.et}">
-          <ContinueRequest>${requestId}</ContinueRequest>
+          <RetrieveRequest>
+            <ContinueRequest>${requestId}</ContinueRequest>
+          </RetrieveRequest>
         </RetrieveRequestMsg>`;
     } else {
       // Initial retrieve request
@@ -253,7 +255,22 @@ export async function retrieve(objectType, properties, filter = null, logger = n
 
     // Check for errors
     if (status === 'Error') {
-      const errorMsg = response.Results?.StatusMessage || 'Unknown error';
+      // Try to extract error message from various possible locations
+      let errorMsg = 'Unknown error';
+      if (response.Results) {
+        const results = Array.isArray(response.Results) ? response.Results : [response.Results];
+        const errorResult = results.find(r => r.StatusMessage || r.ErrorCode);
+        if (errorResult) {
+          errorMsg = errorResult.StatusMessage || `ErrorCode: ${errorResult.ErrorCode}`;
+        }
+      }
+      // Also check for error in OverallStatusMessage
+      if (response.OverallStatusMessage) {
+        errorMsg = response.OverallStatusMessage;
+      }
+      if (logger) {
+        logger.debug(`SOAP Error Response: ${JSON.stringify(response)}`);
+      }
       throw new Error(`Retrieve failed: ${errorMsg}`);
     }
 
@@ -307,10 +324,22 @@ export async function deleteObjects(objectType, objects, logger = null) {
       ${objectsXml}
     </DeleteRequest>`;
 
-  const body = await makeSoapRequest(soapBody, logger);
+  const body = await makeSoapRequest(soapBody, logger, 0, 'Delete');
+
+  if (logger) {
+    logger.debug(`Delete response body: ${JSON.stringify(body)}`);
+  }
+
   const response = body.DeleteResponse;
 
   if (!response) {
+    // Check if there's an alternative response structure
+    if (body.DeleteResponseMsg) {
+      const deleteResponse = body.DeleteResponseMsg;
+      if (logger) {
+        logger.debug(`Found DeleteResponseMsg: ${JSON.stringify(deleteResponse)}`);
+      }
+    }
     throw new Error('Invalid SOAP response: missing DeleteResponse');
   }
 

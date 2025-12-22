@@ -86,6 +86,8 @@ The toolkit includes safety patterns to prevent accidental deletion of system Da
 
 ## Usage
 
+> **Note:** If your folder path contains spaces or special characters (parentheses, etc.), run scripts directly with `node` instead of using `npm run` to avoid shell parsing issues.
+
 ### Test Connection
 
 ```bash
@@ -99,17 +101,20 @@ node src/index.js test
 Generate a comprehensive report without making any changes:
 
 ```bash
-# Basic audit
-npm run audit -- --folder "Archive/Old Campaigns"
+# Basic audit - use full path from "Data Extensions" root
+node src/scripts/audit-folder.js --folder "Data Extensions/Campaigns/2016/5471 - Cash Offer (resend)"
+
+# Audit with a simpler folder path
+node src/scripts/audit-folder.js --folder "Data Extensions/Archive/Old Campaigns"
 
 # Output JSON only
-npm run audit -- --folder "Archive" --output json
+node src/scripts/audit-folder.js --folder "Data Extensions/Archive" --output json
 
 # Skip dependency checks (faster)
-npm run audit -- --folder "Archive" --check-dependencies false
+node src/scripts/audit-folder.js --folder "Data Extensions/Archive" --check-dependencies false
 
 # Skip row counts (faster)
-npm run audit -- --folder "Archive" --include-row-counts false
+node src/scripts/audit-folder.js --folder "Data Extensions/Archive" --include-row-counts false
 ```
 
 **Options:**
@@ -127,22 +132,22 @@ Delete all DEs within a folder and its subfolders:
 
 ```bash
 # Dry run (default) - see what would be deleted
-npm run delete-des -- --folder "Archive/Old Campaigns"
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/Campaigns/2016/5471 - Cash Offer (resend)"
 
 # Interactive mode - select which DEs to delete
-npm run delete-des -- --folder "Archive" --interactive
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" --interactive
 
-# Actually delete (requires confirmation)
-npm run delete-des -- --folder "Archive" --confirm
+# Actually delete (requires confirmation) - deletes all DEs in folder and subfolders
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/Campaigns/2016/5471 - Cash Offer (resend)" --confirm
 
 # Delete DEs not modified in 90 days
-npm run delete-des -- --folder "Archive" --older-than-days 90 --confirm
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" --older-than-days 90 --confirm
 
 # Skip dependency check (dangerous)
-npm run delete-des -- --folder "Archive" --skip-dependency-check --confirm
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" --skip-dependency-check --confirm
 
 # Force delete even with dependencies (very dangerous)
-npm run delete-des -- --folder "Archive" --force-delete-with-dependencies --confirm
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" --force-delete-with-dependencies --confirm
 ```
 
 **Options:**
@@ -167,13 +172,13 @@ Delete a folder and all its subfolders (must be empty unless --force):
 
 ```bash
 # Dry run - preview folder deletion
-npm run delete-folders -- --folder "Archive/Old Campaigns"
+node src/scripts/delete-folders.js --folder "Data Extensions/Archive/Old Campaigns"
 
 # Actually delete empty folders
-npm run delete-folders -- --folder "Archive" --confirm
+node src/scripts/delete-folders.js --folder "Data Extensions/Archive" --confirm
 
 # Delete folders AND their contents (force mode)
-npm run delete-folders -- --folder "Archive" --force --confirm
+node src/scripts/delete-folders.js --folder "Data Extensions/Archive" --force --confirm
 ```
 
 **Options:**
@@ -288,6 +293,20 @@ WEBHOOK_URL=https://hooks.slack.com/services/...
 
 ## Troubleshooting
 
+### Command Line Parsing Issues
+
+**Problem:** npm run commands fail with special characters in folder names
+
+When folder paths contain spaces or parentheses (e.g., "5471 - Cash Offer (resend)"), npm's argument parsing may fail:
+```
+npm warn could not parse: --folder "Data Extensions/Campaigns/5471 - Cash Offer (resend)"
+```
+
+**Solution:** Run scripts directly with node:
+```bash
+node src/scripts/audit-folder.js --folder "Data Extensions/Campaigns/5471 - Cash Offer (resend)"
+```
+
 ### Authentication Errors
 
 **Error:** `SFMC Authentication failed: invalid_client`
@@ -298,6 +317,10 @@ WEBHOOK_URL=https://hooks.slack.com/services/...
 **Error:** `Host not found`
 - Verify SFMC_SUBDOMAIN is correct
 - Format should be just the subdomain, not the full URL
+
+**Error:** `HTTP 405 - Method Not Allowed`
+- SFMC_SOAP_URL must end with `/Service.asmx`
+- The toolkit auto-appends this, but verify your URL format
 
 ### Permission Errors
 
@@ -314,11 +337,24 @@ Did you mean one of these?
   - Data Extensions/Archive/2023 Campaigns
 ```
 
+**Tip:** Pay attention to spacing - "5471- Cash" is different from "5471 - Cash" (space before dash).
+
 ### Rate Limiting
 
 If you see `429 Too Many Requests`:
 - Increase `API_RATE_LIMIT_DELAY_MS` in `.env`
 - Reduce `--batch-size` for deletion operations
+
+### Debug Mode
+
+For detailed debugging, set `LOG_LEVEL=debug` in your `.env` file. You can also run the included debug scripts:
+```bash
+# Test SOAP connectivity
+node debug-soap.js
+
+# Test Delete operation format
+node debug-delete.js
+```
 
 ## Best Practices
 

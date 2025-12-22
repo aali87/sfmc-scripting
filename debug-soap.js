@@ -95,8 +95,19 @@ async function debug() {
     });
 
     console.log('\nSOAP Response Status:', soapResponse.status);
-    console.log('Response preview:', soapResponse.data.substring(0, 500));
-    console.log('\n✓ SOAP connection successful!');
+    console.log('Response preview:', soapResponse.data.substring(0, 1500));
+
+    // Check if response contains error
+    if (soapResponse.data.includes('OverallStatus>Error')) {
+      console.log('\n⚠️ Response contains error status');
+      // Extract error details
+      const match = soapResponse.data.match(/<OverallStatusMessage>([^<]+)<\/OverallStatusMessage>/);
+      if (match) {
+        console.log('Error message:', match[1]);
+      }
+    } else {
+      console.log('\n✓ SOAP connection successful!');
+    }
 
   } catch (error) {
     console.log('\n❌ Error occurred:');
