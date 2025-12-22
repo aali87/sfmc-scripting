@@ -45,7 +45,9 @@ export async function getAccessToken(logger = null) {
     logger.debug('Fetching new access token from SFMC');
   }
 
-  const tokenUrl = `${config.sfmc.authUrl}/v2/token`;
+  // Remove trailing slash from authUrl to avoid double slashes
+  const authBase = config.sfmc.authUrl.replace(/\/$/, '');
+  const tokenUrl = `${authBase}/v2/token`;
 
   try {
     const response = await axios.post(tokenUrl, {

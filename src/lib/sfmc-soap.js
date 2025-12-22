@@ -29,7 +29,7 @@ async function sleep(ms) {
 }
 
 /**
- * Build SOAP envelope with WS-Security header
+ * Build SOAP envelope with fueloauth header (OAuth 2.0)
  * @param {string} accessToken - OAuth access token
  * @param {string} bodyContent - SOAP body XML content
  * @returns {string} Complete SOAP envelope XML
@@ -38,12 +38,7 @@ function buildSoapEnvelope(accessToken, bodyContent) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <soapenv:Envelope xmlns:soapenv="${NAMESPACES.soap}" xmlns:et="${NAMESPACES.et}">
   <soapenv:Header>
-    <wsse:Security xmlns:wsse="${NAMESPACES.wsse}">
-      <wsse:UsernameToken>
-        <wsse:Username>${config.sfmc.accountId}</wsse:Username>
-        <wsse:Password>${accessToken}</wsse:Password>
-      </wsse:UsernameToken>
-    </wsse:Security>
+    <fueloauth xmlns="http://exacttarget.com">${accessToken}</fueloauth>
   </soapenv:Header>
   <soapenv:Body>
     ${bodyContent}
@@ -89,7 +84,12 @@ async function parseSoapResponse(xmlResponse) {
 async function makeSoapRequest(soapBody, logger, retryCount = 0) {
   const tokenInfo = await getAccessToken(logger);
   const envelope = buildSoapEnvelope(tokenInfo.accessToken, soapBody);
-  const soapUrl = tokenInfo.soapInstanceUrl || config.sfmc.soapUrl;
+
+  // Get SOAP URL and ensure it ends with /Service.asmx
+  let soapUrl = tokenInfo.soapInstanceUrl || config.sfmc.soapUrl;
+  if (!soapUrl.endsWith('/Service.asmx')) {
+    soapUrl = soapUrl.replace(/\/?$/, '/Service.asmx');
+  }
 
   if (logger) {
     logger.api('POST', soapUrl, { bodyLength: soapBody.length });
