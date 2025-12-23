@@ -1,6 +1,6 @@
 # SFMC Data Extension Toolkit
 
-A comprehensive Node.js toolkit for Salesforce Marketing Cloud (SFMC) to audit, analyze dependencies, and safely delete Data Extensions and folders. Designed for platform teams managing production SFMC instances containing significant PII.
+A comprehensive Node.js toolkit for Salesforce Marketing Cloud (SFMC) to audit, analyze dependencies, and safely delete Data Extensions and folders. Designed for platform teams managing production SFMC instances.
 
 ## Features
 
@@ -8,26 +8,25 @@ A comprehensive Node.js toolkit for Salesforce Marketing Cloud (SFMC) to audit, 
 - **Dependency Checking** - Identify Automations, Journeys, Triggered Sends, and Query Activities that reference DEs
 - **Safety First** - Protected item patterns, dry-run mode by default, and multi-step confirmations
 - **Schema Backups** - Automatically backup DE schemas before deletion
+- **Folder Caching** - Reduces API calls by caching folder structure locally
 - **Progress Persistence** - Resume interrupted operations
 - **Detailed Logging** - Full audit trail for compliance
 - **Multiple Output Formats** - Console, JSON, and CSV reports
 
 ## Prerequisites
 
-### SFMC Requirements
+### SFMC Installed Package Setup
 
-1. **Installed Package** with the following permissions:
-   - Data Extensions: Read, Write, Delete
-   - Automations: Read
-   - Journeys: Read
-   - Triggered Sends: Read
-   - List and Subscribers: Read
+Create a **Server-to-Server** installed package in SFMC with these permissions:
 
-2. **API Credentials**:
-   - Client ID
-   - Client Secret
-   - Authentication Base URL (subdomain)
-   - Account ID (MID)
+| Scope | Access Level | Purpose |
+|-------|--------------|---------|
+| Data Extensions | Read, Write | Query and delete DEs (Write includes delete capability) |
+| Automations | Read | Check for automation dependencies |
+| Journeys | Read | Check for journey dependencies |
+| Email | Read | Check Triggered Send dependencies |
+
+> **Note:** There is no separate "Delete" permission for Data Extensions. The "Write" permission encompasses create, update, AND delete operations.
 
 ### System Requirements
 
@@ -37,7 +36,8 @@ A comprehensive Node.js toolkit for Salesforce Marketing Cloud (SFMC) to audit, 
 ## Installation
 
 ```bash
-# Clone or download the toolkit
+# Clone the repository
+git clone https://github.com/yourusername/sfmc-de-toolkit.git
 cd sfmc-de-toolkit
 
 # Install dependencies
@@ -56,15 +56,19 @@ cp .env.example .env
 Edit `.env` with your SFMC credentials:
 
 ```env
-# Required
+# Required - from your SFMC Installed Package
 SFMC_CLIENT_ID=your_client_id
 SFMC_CLIENT_SECRET=your_client_secret
-SFMC_SUBDOMAIN=your_subdomain
 SFMC_ACCOUNT_ID=your_mid
 
-# Safety Settings (customize as needed)
-PROTECTED_FOLDER_PATTERNS=System,CASL,Shared Data Extensions,SYS_,Platform
-PROTECTED_DE_PREFIXES=SYS_,CASL_,CAD_,_Subscribers,_Bounce
+# SFMC API URLs (replace YOUR_SUBDOMAIN with your tenant subdomain)
+SFMC_AUTH_URL=https://YOUR_SUBDOMAIN.auth.marketingcloudapis.com
+SFMC_SOAP_URL=https://YOUR_SUBDOMAIN.soap.marketingcloudapis.com/Service.asmx
+SFMC_REST_URL=https://YOUR_SUBDOMAIN.rest.marketingcloudapis.com
+
+# Safety Settings
+PROTECTED_FOLDER_PATTERNS=System,CASL,Shared Data Extensions,Platform
+PROTECTED_DE_PREFIXES=SYS_,CASL_,_Subscribers,_Bounce
 
 # Rate Limiting
 API_RATE_LIMIT_DELAY_MS=200
@@ -84,6 +88,25 @@ The toolkit includes safety patterns to prevent accidental deletion of system Da
 - _Subscribers, _Bounce, _Click, _Job, _Journey
 - ent., ContactMaster
 
+## Quick Start
+
+```bash
+# 1. Test your connection
+node src/index.js test
+
+# 2. Sync folder structure (caches locally for faster operations)
+node src/index.js sync
+
+# 3. Audit a folder to see what's inside
+node src/scripts/audit-folder.js --folder "Data Extensions/YourFolder"
+
+# 4. Preview what would be deleted (dry-run mode)
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/YourFolder"
+
+# 5. Actually delete (requires --confirm flag)
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/YourFolder" --confirm
+```
+
 ## Usage
 
 > **Note:** If your folder path contains spaces or special characters (parentheses, etc.), run scripts directly with `node` instead of using `npm run` to avoid shell parsing issues.
@@ -91,14 +114,12 @@ The toolkit includes safety patterns to prevent accidental deletion of system Da
 ### Test Connection
 
 ```bash
-npm start test
-# or
 node src/index.js test
 ```
 
 ### Sync Folder Structure (Cache Management)
 
-The toolkit caches folder structure locally to reduce API calls. On first run, it fetches all folders from SFMC and caches them. Subsequent operations use this cache (valid for 24 hours).
+The toolkit caches folder structure locally to reduce API calls. On first run, it fetches all folders from SFMC and caches them for 24 hours.
 
 ```bash
 # Sync/refresh folder cache from SFMC
@@ -107,18 +128,14 @@ node src/index.js sync
 # Check cache status
 node src/index.js sync --status
 
-# Clear cache without refreshing
+# Clear cache
 node src/index.js sync --clear
 ```
 
 To force a fresh fetch during any operation, use `--refresh-cache`:
 
 ```bash
-# Audit with fresh data from SFMC
-node src/scripts/audit-folder.js --folder "Data Extensions/Archive" --refresh-cache
-
-# Delete with fresh data
-node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" --refresh-cache
+node src/scripts/audit-folder.js --folder "Data Extensions/MyFolder" --refresh-cache
 ```
 
 ### Audit a Folder (Read-Only)
@@ -126,11 +143,8 @@ node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" --
 Generate a comprehensive report without making any changes:
 
 ```bash
-# Basic audit - use full path from "Data Extensions" root
-node src/scripts/audit-folder.js --folder "Data Extensions/Campaigns/2016/5471 - Cash Offer (resend)"
-
-# Audit with a simpler folder path
-node src/scripts/audit-folder.js --folder "Data Extensions/Archive/Old Campaigns"
+# Basic audit
+node src/scripts/audit-folder.js --folder "Data Extensions/Archive/2023"
 
 # Output JSON only
 node src/scripts/audit-folder.js --folder "Data Extensions/Archive" --output json
@@ -143,40 +157,36 @@ node src/scripts/audit-folder.js --folder "Data Extensions/Archive" --include-ro
 ```
 
 **Options:**
+
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--folder, -f` | Folder path or name (required) | - |
+| `--folder, -f` | Folder path (required) | - |
 | `--output, -o` | Output format: console, json, csv, all | all |
 | `--check-dependencies, -d` | Run dependency checks | true |
 | `--include-row-counts, -r` | Include record counts | true |
 | `--max-depth` | Maximum subfolder depth | unlimited |
-| `--refresh-cache` | Force refresh cache from SFMC API | false |
+| `--refresh-cache` | Force refresh cache from API | false |
 
 ### Delete Data Extensions
 
 Delete all DEs within a folder and its subfolders:
 
 ```bash
-# Dry run (default) - see what would be deleted
-node src/scripts/delete-data-extensions.js --folder "Data Extensions/Campaigns/2016/5471 - Cash Offer (resend)"
+# Dry run (default) - preview what would be deleted
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive/OldCampaigns"
 
 # Interactive mode - select which DEs to delete
 node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" --interactive
 
-# Actually delete (requires confirmation) - deletes all DEs in folder and subfolders
-node src/scripts/delete-data-extensions.js --folder "Data Extensions/Campaigns/2016/5471 - Cash Offer (resend)" --confirm
+# Actually delete (requires confirmation)
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive/OldCampaigns" --confirm
 
 # Delete DEs not modified in 90 days
 node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" --older-than-days 90 --confirm
-
-# Skip dependency check (dangerous)
-node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" --skip-dependency-check --confirm
-
-# Force delete even with dependencies (very dangerous)
-node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" --force-delete-with-dependencies --confirm
 ```
 
 **Options:**
+
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--folder, -f` | Folder containing DEs (required) | - |
@@ -191,7 +201,7 @@ node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" --
 | `--exclude-pattern` | Regex pattern to exclude | - |
 | `--include-pattern` | Regex pattern to include | - |
 | `--batch-size` | DEs per batch | 10 |
-| `--refresh-cache` | Force refresh cache from SFMC API | false |
+| `--refresh-cache` | Force refresh cache from API | false |
 
 ### Delete Folders
 
@@ -199,7 +209,7 @@ Delete a folder and all its subfolders (must be empty unless --force):
 
 ```bash
 # Dry run - preview folder deletion
-node src/scripts/delete-folders.js --folder "Data Extensions/Archive/Old Campaigns"
+node src/scripts/delete-folders.js --folder "Data Extensions/Archive/OldCampaigns"
 
 # Actually delete empty folders
 node src/scripts/delete-folders.js --folder "Data Extensions/Archive" --confirm
@@ -209,6 +219,7 @@ node src/scripts/delete-folders.js --folder "Data Extensions/Archive" --force --
 ```
 
 **Options:**
+
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--folder, -f` | Folder to delete (required) | - |
@@ -216,7 +227,7 @@ node src/scripts/delete-folders.js --folder "Data Extensions/Archive" --force --
 | `--confirm` | Enable actual deletion | false |
 | `--force` | Delete contents before folders | false |
 | `--skip-protected` | Skip protected folders vs abort | false |
-| `--refresh-cache` | Force refresh cache from SFMC API | false |
+| `--refresh-cache` | Force refresh cache from API | false |
 
 ## Safety Features
 
@@ -253,12 +264,12 @@ Before deletion, DE schemas are backed up to `backup/[timestamp]/`:
 ```json
 {
   "backupMetadata": {
-    "createdAt": "2025-12-22T14:30:00Z",
+    "createdAt": "2025-01-15T10:30:00Z",
     "toolVersion": "1.0.0"
   },
   "dataExtension": {
-    "name": "Campaign_Data_2023",
-    "customerKey": "Campaign_Data_2023",
+    "name": "My_Data_Extension",
+    "customerKey": "My_Data_Extension",
     "fields": [...]
   }
 }
@@ -272,31 +283,22 @@ If an operation is interrupted (Ctrl+C, error):
 
 ## Output Files
 
-### Audit Reports
-- `audit/audit-[timestamp].json` - Full JSON report
-- `audit/audit-[timestamp].csv` - Spreadsheet-friendly format
-
-### Logs
-- `logs/[script]-[timestamp].log` - Detailed operation log
-
-### Audit Logs (Deletion)
-- `audit/delete-des-[timestamp].json` - Deletion audit trail
-- `audit/delete-folders-[timestamp].json` - Folder deletion audit
-
-### Backups
-- `backup/[timestamp]/[de-key].json` - Schema backups
-
-### Undo Scripts
-- `undo/undo-[timestamp].js` - Template to recreate deleted DEs (schema only)
+| Directory | Contents |
+|-----------|----------|
+| `audit/` | JSON and CSV audit reports |
+| `logs/` | Detailed operation logs |
+| `backup/` | DE schema backups before deletion |
+| `state/` | Operation state for resume capability |
+| `undo/` | Templates to recreate deleted DEs |
+| `cache/` | Cached folder structure |
 
 ## Scheduled Execution
 
 For running via cron or scheduled tasks:
 
 ```bash
-# Non-interactive mode requires confirmation phrase
 node src/scripts/delete-data-extensions.js \
-  --folder "Archive" \
+  --folder "Data Extensions/Archive" \
   --confirm \
   --non-interactive \
   --confirm-phrase "DELETE 15 DATA EXTENSIONS" \
@@ -309,7 +311,7 @@ Send results to Slack, Teams, or monitoring systems:
 
 ```bash
 node src/scripts/delete-data-extensions.js \
-  --folder "Archive" \
+  --folder "Data Extensions/Archive" \
   --confirm \
   --webhook-url "https://hooks.slack.com/services/..."
 ```
@@ -321,90 +323,69 @@ WEBHOOK_URL=https://hooks.slack.com/services/...
 
 ## Troubleshooting
 
-### Command Line Parsing Issues
+### Command Line Issues
 
-**Problem:** npm run commands fail with special characters in folder names
+**Problem:** Arguments with spaces or special characters fail
 
-When folder paths contain spaces or parentheses (e.g., "5471 - Cash Offer (resend)"), npm's argument parsing may fail:
-```
-npm warn could not parse: --folder "Data Extensions/Campaigns/5471 - Cash Offer (resend)"
-```
-
-**Solution:** Run scripts directly with node:
+**Solution:** Run scripts directly with node (not npm run):
 ```bash
-node src/scripts/audit-folder.js --folder "Data Extensions/Campaigns/5471 - Cash Offer (resend)"
+node src/scripts/audit-folder.js --folder "Data Extensions/My Folder (2023)"
 ```
 
 ### Authentication Errors
 
-**Error:** `SFMC Authentication failed: invalid_client`
-- Verify SFMC_CLIENT_ID and SFMC_CLIENT_SECRET
-- Ensure the Installed Package is active
-- Check the package has required permissions
-
-**Error:** `Host not found`
-- Verify SFMC_SUBDOMAIN is correct
-- Format should be just the subdomain, not the full URL
-
-**Error:** `HTTP 405 - Method Not Allowed`
-- SFMC_SOAP_URL must end with `/Service.asmx`
-- The toolkit auto-appends this, but verify your URL format
+| Error | Solution |
+|-------|----------|
+| `invalid_client` | Verify SFMC_CLIENT_ID and SFMC_CLIENT_SECRET |
+| `Host not found` | Check your subdomain in the API URLs |
+| `HTTP 405` | Ensure SFMC_SOAP_URL ends with `/Service.asmx` |
 
 ### Permission Errors
 
-**Error:** `403 Forbidden` or `Insufficient privileges`
-- Verify the Installed Package has Data Extension Read/Write/Delete permissions
+`403 Forbidden` or `Insufficient privileges`:
+- Verify the Installed Package has Data Extension Read/Write permissions
 - For dependency checks, ensure Automation and Journey read access
 
 ### Folder Not Found
 
-If your folder path isn't found, the toolkit suggests similar folders:
+The toolkit suggests similar folders when a path isn't found:
 ```
 Did you mean one of these?
-  - Data Extensions/Archive/Old Campaigns
-  - Data Extensions/Archive/2023 Campaigns
+  - Data Extensions/Archive/2023
+  - Data Extensions/Archive/Campaigns
 ```
-
-**Tip:** Pay attention to spacing - "5471- Cash" is different from "5471 - Cash" (space before dash).
-
-### Rate Limiting
-
-If you see `429 Too Many Requests`:
-- Increase `API_RATE_LIMIT_DELAY_MS` in `.env`
-- Reduce `--batch-size` for deletion operations
 
 ### Debug Mode
 
-For detailed debugging, set `LOG_LEVEL=debug` in your `.env` file. You can also run the included debug scripts:
+Set `LOG_LEVEL=debug` in `.env` for detailed logging. Debug scripts are also available:
 ```bash
-# Test SOAP connectivity
-node debug-soap.js
-
-# Test Delete operation format
-node debug-delete.js
+node debug-soap.js    # Test SOAP connectivity
+node debug-delete.js  # Test delete operation format
 ```
 
 ## Best Practices
 
 1. **Always run audit first** - Understand what's in a folder before deleting
 2. **Use dry-run mode** - Preview all deletions before confirming
-3. **Start with a test folder** - Create a test folder in a sandbox BU first
+3. **Start with a test folder** - Test in a sandbox BU first
 4. **Check dependencies** - Don't skip dependency checks in production
-5. **Keep backups** - Schema backups are created by default; keep them
+5. **Keep backups** - Schema backups are created by default; retain them
 6. **Review logs** - Check audit logs after operations for compliance
-7. **Use date filters** - Only delete DEs older than X days to avoid accidents
+7. **Use date filters** - Delete only DEs older than X days to avoid accidents
+8. **Sync first** - Run `sync` before operations to cache folder structure
 
 ## API Rate Limits
 
-SFMC recommends 200-500ms between API calls. The toolkit defaults to 200ms delay and implements:
-- Automatic retry with exponential backoff for rate limit errors
-- Configurable batch sizes with progress checkpoints
-- Token caching with automatic refresh
+SFMC recommends 200-500ms between API calls. The toolkit:
+- Defaults to 200ms delay between calls
+- Implements automatic retry with exponential backoff
+- Caches folder structure to minimize API calls
+- Supports configurable batch sizes
 
-## Support
+## Contributing
 
-For issues and feature requests, please open an issue on the repository.
+Contributions are welcome! Please open an issue or submit a pull request.
 
 ## License
 
-MIT License - See LICENSE file for details.
+MIT License - See [LICENSE](LICENSE) file for details.
