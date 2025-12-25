@@ -294,6 +294,71 @@ async function getConfirmation(count, nonInteractive, confirmPhrase) {
 }
 
 /**
+ * Export dependencies to CSV file
+ * @param {object[]} desWithDeps - Data Extensions with dependencies
+ * @param {string} targetFolder - Target folder name for filename
+ * @returns {Promise<string>} Path to the exported CSV file
+ */
+async function exportDependenciesToCsv(desWithDeps, targetFolder) {
+  const timestamp = dayjs().format('YYYYMMDD-HHmmss');
+  const sanitizedFolder = targetFolder.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30);
+  const filename = `dependencies-${sanitizedFolder}-${timestamp}.csv`;
+  const outputDir = path.resolve(process.cwd(), 'audit');
+
+  // Ensure output directory exists
+  if (!fs.existsSync(outputDir)) {
+    fs.mkdirSync(outputDir, { recursive: true });
+  }
+
+  const filepath = path.join(outputDir, filename);
+
+  // CSV header
+  const header = [
+    'Data Extension Name',
+    'Data Extension CustomerKey',
+    'Dependency Type',
+    'Dependency Name',
+    'Dependency ID',
+    'Dependency Status',
+    'Details',
+    'Can Auto-Delete'
+  ].join(',');
+
+  const rows = [header];
+
+  for (const de of desWithDeps) {
+    for (const dep of de.dependencies || []) {
+      // Escape CSV values (wrap in quotes if contains comma or quote)
+      const escapeCSV = (val) => {
+        if (val === null || val === undefined) return '';
+        const str = String(val);
+        if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+          return `"${str.replace(/"/g, '""')}"`;
+        }
+        return str;
+      };
+
+      const canAutoDelete = dep.type === 'Filter Activity' ? 'Check Required' : 'No';
+
+      rows.push([
+        escapeCSV(de.name),
+        escapeCSV(de.customerKey),
+        escapeCSV(dep.type),
+        escapeCSV(dep.name),
+        escapeCSV(dep.id),
+        escapeCSV(dep.status),
+        escapeCSV(dep.details || dep.reason || ''),
+        escapeCSV(canAutoDelete)
+      ].join(','));
+    }
+  }
+
+  fs.writeFileSync(filepath, rows.join('\n'), 'utf-8');
+
+  return filepath;
+}
+
+/**
  * Categorize dependencies into deletable (standalone filters) and blocking (other types)
  * @param {object} de - Data Extension with dependencies
  * @param {object[]} automations - Pre-loaded automations for filter check
@@ -343,12 +408,40 @@ async function categorizeDependencies(de, automations, logger) {
  * @param {object} logger - Logger instance
  * @param {boolean} autoDeleteFilters - Auto-delete standalone filters without prompting
  * @param {boolean} nonInteractive - Running in non-interactive mode
+ * @param {string} targetFolder - Target folder name (for CSV export filename)
  * @returns {Promise<{proceed: object[], skip: object[], filtersToDelete: object[]}>}
  */
-async function handleDependenciesInteractively(desWithDeps, logger, autoDeleteFilters = false, nonInteractive = false) {
+async function handleDependenciesInteractively(desWithDeps, logger, autoDeleteFilters = false, nonInteractive = false, targetFolder = 'unknown') {
   const proceed = [];
   const skip = [];
   const filtersToDelete = [];
+  let csvExported = false;
+
+  // Offer CSV export option first (before processing individual DEs)
+  if (!nonInteractive && desWithDeps.length > 0) {
+    console.log('');
+    const exportAnswer = await inquirer.prompt([{
+      type: 'list',
+      name: 'exportFirst',
+      message: `${desWithDeps.length} DE(s) have dependencies. Would you like to export them to CSV first?`,
+      choices: [
+        { name: 'No, proceed with interactive resolution', value: 'no' },
+        { name: 'Yes, export to CSV then continue', value: 'export' },
+        { name: 'Yes, export to CSV and abort (review offline)', value: 'export_abort' }
+      ]
+    }]);
+
+    if (exportAnswer.exportFirst === 'export' || exportAnswer.exportFirst === 'export_abort') {
+      const csvPath = await exportDependenciesToCsv(desWithDeps, targetFolder);
+      console.log(chalk.green(`\n✓ Dependencies exported to: ${csvPath}`));
+      csvExported = true;
+
+      if (exportAnswer.exportFirst === 'export_abort') {
+        console.log(chalk.yellow('\nOperation aborted. Review the CSV file and run again when ready.'));
+        return { proceed: [], skip: [], filtersToDelete: [], aborted: true, csvExported: true, csvPath };
+      }
+    }
+  }
 
   // Pre-load automations for efficiency
   console.log(chalk.gray('\nAnalyzing filter dependencies...'));
@@ -487,7 +580,7 @@ async function handleDependenciesInteractively(desWithDeps, logger, autoDeleteFi
     }
   }
 
-  return { proceed, skip, filtersToDelete, aborted: false };
+  return { proceed, skip, filtersToDelete, aborted: false, csvExported };
 }
 
 /**
@@ -820,7 +913,8 @@ async function runDeletion() {
             withDeps,
             logger,
             argv.autoDeleteFilters,
-            argv.nonInteractive
+            argv.nonInteractive,
+            targetFolder.Name || argv.folder
           );
 
           if (depResult.aborted) {
