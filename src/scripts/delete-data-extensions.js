@@ -355,24 +355,46 @@ async function handleDependenciesInteractively(desWithDeps, logger, autoDeleteFi
     const { deletableFilters, blockingDeps } = await categorizeDependencies(de, automations, logger);
 
     console.log('');
-    console.log(chalk.yellow(`━━━ ${de.name} ━━━`));
+    // DE header with box drawing
+    const deName = de.name.length > 50 ? de.name.substring(0, 47) + '...' : de.name;
+    console.log(chalk.yellow('┌─ ') + chalk.yellow.bold(deName) + chalk.yellow(' ─'.padEnd(55 - deName.length, '─') + '┐'));
 
-    // Show deletable filters (standalone)
+    // Show deletable filters (standalone) - these are OK
     if (deletableFilters.length > 0) {
-      console.log(chalk.cyan(`  Standalone Filter Activities (can be auto-deleted):`));
+      console.log(chalk.yellow('│'));
+      console.log(chalk.yellow('│ ') + chalk.green.bold('✓ CAN AUTO-DELETE:'));
       deletableFilters.forEach(f => {
-        console.log(chalk.cyan(`    • ${f.name}`));
+        const name = f.name.length > 48 ? f.name.substring(0, 45) + '...' : f.name;
+        console.log(chalk.yellow('│   ') + chalk.green(`Filter: ${name}`));
       });
     }
 
-    // Show blocking dependencies
+    // Show blocking dependencies - these need attention
     if (blockingDeps.length > 0) {
-      console.log(chalk.red(`  Blocking Dependencies (require manual resolution):`));
-      blockingDeps.forEach(dep => {
-        const reason = dep.reason ? ` - ${dep.reason}` : '';
-        console.log(chalk.red(`    • ${dep.type}: ${dep.name}${reason}`));
-      });
+      console.log(chalk.yellow('│'));
+      console.log(chalk.yellow('│ ') + chalk.red.bold('✗ BLOCKING (require manual resolution):'));
+
+      // Group by type for cleaner display
+      const blockingByType = {};
+      for (const dep of blockingDeps) {
+        if (!blockingByType[dep.type]) {
+          blockingByType[dep.type] = [];
+        }
+        blockingByType[dep.type].push(dep);
+      }
+
+      for (const [type, deps] of Object.entries(blockingByType)) {
+        console.log(chalk.yellow('│   ') + chalk.red(`${type}:`));
+        deps.forEach(dep => {
+          const name = dep.name.length > 40 ? dep.name.substring(0, 37) + '...' : dep.name;
+          const reason = dep.reason ? chalk.gray(` (${dep.reason})`) : '';
+          console.log(chalk.yellow('│     ') + chalk.white(`• ${name}`) + reason);
+        });
+      }
     }
+
+    console.log(chalk.yellow('│'));
+    console.log(chalk.yellow('└' + '─'.repeat(56) + '┘'));
 
     // Determine action
     if (blockingDeps.length > 0) {
@@ -735,16 +757,37 @@ async function runDeletion() {
       if (withDeps.length > 0) {
         console.log('');
         console.log(chalk.yellow.bold(`⚠️  ${withDeps.length} DATA EXTENSION(S) HAVE DEPENDENCIES:`));
+        console.log('');
 
-        // Quick summary first
+        // Display in a formatted table-like view
         withDeps.forEach(de => {
-          console.log(chalk.yellow(`\n   ${de.name}:`));
-          de.dependencies.slice(0, 5).forEach(dep => {
-            console.log(chalk.gray(`     - ${dep.type}: ${dep.name}`));
-          });
-          if (de.dependencies.length > 5) {
-            console.log(chalk.gray(`     ... and ${de.dependencies.length - 5} more`));
+          // DE header with box
+          console.log(chalk.yellow('  ┌─ ') + chalk.yellow.bold(de.name) + chalk.yellow(' ─'.padEnd(50 - de.name.length, '─') + '┐'));
+
+          // Group dependencies by type for cleaner display
+          const depsByType = {};
+          for (const dep of de.dependencies) {
+            if (!depsByType[dep.type]) {
+              depsByType[dep.type] = [];
+            }
+            depsByType[dep.type].push(dep);
           }
+
+          // Display each type
+          for (const [type, deps] of Object.entries(depsByType)) {
+            const typeColor = type === 'Filter Activity' ? chalk.cyan : chalk.red;
+            console.log(chalk.yellow('  │ ') + typeColor.bold(`${type} (${deps.length}):`));
+            deps.slice(0, 3).forEach(dep => {
+              const name = dep.name.length > 45 ? dep.name.substring(0, 42) + '...' : dep.name;
+              console.log(chalk.yellow('  │   ') + chalk.gray(`• ${name}`));
+            });
+            if (deps.length > 3) {
+              console.log(chalk.yellow('  │   ') + chalk.gray.italic(`  ... and ${deps.length - 3} more`));
+            }
+          }
+
+          console.log(chalk.yellow('  └' + '─'.repeat(52) + '┘'));
+          console.log('');
         });
 
         if (argv.forceDeleteWithDependencies) {
