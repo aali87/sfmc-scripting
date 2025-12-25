@@ -312,9 +312,17 @@ async function categorizeDependencies(de, automations, logger) {
 
       if (usageCheck.isUsed) {
         // Filter is in an automation - blocking dependency
+        // Deduplicate and limit automation names to prevent extremely long reasons
+        const uniqueAutomationNames = [...new Set(usageCheck.automations.map(a => a.automationName))];
+        const displayNames = uniqueAutomationNames.slice(0, 2);
+        const remaining = uniqueAutomationNames.length - displayNames.length;
+        let reasonText = displayNames.join(', ');
+        if (remaining > 0) {
+          reasonText += ` (+${remaining} more)`;
+        }
         blockingDeps.push({
           ...dep,
-          reason: `Used in automation: ${usageCheck.automations.map(a => a.automationName).join(', ')}`
+          reason: `Used in automation: ${reasonText}`
         });
       } else {
         // Standalone filter - can be deleted
@@ -387,7 +395,12 @@ async function handleDependenciesInteractively(desWithDeps, logger, autoDeleteFi
         console.log(chalk.yellow('│   ') + chalk.red(`${type}:`));
         deps.forEach(dep => {
           const name = dep.name.length > 40 ? dep.name.substring(0, 37) + '...' : dep.name;
-          const reason = dep.reason ? chalk.gray(` (${dep.reason})`) : '';
+          // Truncate reason to prevent extremely long automation names from breaking display
+          let reason = '';
+          if (dep.reason) {
+            const truncatedReason = dep.reason.length > 50 ? dep.reason.substring(0, 47) + '...' : dep.reason;
+            reason = chalk.gray(` (${truncatedReason})`);
+          }
           console.log(chalk.yellow('│     ') + chalk.white(`• ${name}`) + reason);
         });
       }
