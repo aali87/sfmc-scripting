@@ -294,12 +294,13 @@ async function getConfirmation(count, nonInteractive, confirmPhrase) {
 }
 
 /**
- * Export dependencies to CSV file
+ * Export dependencies to CSV file with full automation analysis
  * @param {object[]} desWithDeps - Data Extensions with dependencies
  * @param {string} targetFolder - Target folder name for filename
+ * @param {object} logger - Logger instance
  * @returns {Promise<string>} Path to the exported CSV file
  */
-async function exportDependenciesToCsv(desWithDeps, targetFolder) {
+async function exportDependenciesToCsv(desWithDeps, targetFolder, logger = null) {
   const timestamp = dayjs().format('YYYYMMDD-HHmmss');
   const sanitizedFolder = targetFolder.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30);
   const filename = `dependencies-${sanitizedFolder}-${timestamp}.csv`;
@@ -312,7 +313,26 @@ async function exportDependenciesToCsv(desWithDeps, targetFolder) {
 
   const filepath = path.join(outputDir, filename);
 
-  // CSV header
+  // Pre-load automations for filter analysis
+  console.log(chalk.gray('  Analyzing filter dependencies for CSV export...'));
+  let automations = [];
+  try {
+    automations = await getAutomations(logger);
+  } catch (e) {
+    if (logger) logger.debug(`Could not load automations for CSV: ${e.message}`);
+  }
+
+  // Escape CSV values (wrap in quotes if contains comma or quote)
+  const escapeCSV = (val) => {
+    if (val === null || val === undefined) return '';
+    const str = String(val);
+    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  };
+
+  // CSV header - expanded to include automation usage details
   const header = [
     'Data Extension Name',
     'Data Extension CustomerKey',
@@ -321,35 +341,73 @@ async function exportDependenciesToCsv(desWithDeps, targetFolder) {
     'Dependency ID',
     'Dependency Status',
     'Details',
-    'Can Auto-Delete'
+    'Used In Automation',
+    'Automation Name',
+    'Automation Status',
+    'Can Auto-Delete',
+    'Blocking'
   ].join(',');
 
   const rows = [header];
 
   for (const de of desWithDeps) {
     for (const dep of de.dependencies || []) {
-      // Escape CSV values (wrap in quotes if contains comma or quote)
-      const escapeCSV = (val) => {
-        if (val === null || val === undefined) return '';
-        const str = String(val);
-        if (str.includes(',') || str.includes('"') || str.includes('\n')) {
-          return `"${str.replace(/"/g, '""')}"`;
+      if (dep.type === 'Filter Activity') {
+        // Check if filter is used in automations
+        const usageCheck = await checkFilterInAutomations(dep.id, automations, logger);
+
+        if (usageCheck.isUsed && usageCheck.automations.length > 0) {
+          // Add a row for each automation the filter is used in
+          for (const automation of usageCheck.automations) {
+            rows.push([
+              escapeCSV(de.name),
+              escapeCSV(de.customerKey),
+              escapeCSV(dep.type),
+              escapeCSV(dep.name),
+              escapeCSV(dep.id),
+              escapeCSV(dep.status),
+              escapeCSV(dep.details || ''),
+              'Yes',
+              escapeCSV(automation.automationName),
+              escapeCSV(automation.automationStatus),
+              'No',
+              'Yes'
+            ].join(','));
+          }
+        } else {
+          // Standalone filter - not used in any automation
+          rows.push([
+            escapeCSV(de.name),
+            escapeCSV(de.customerKey),
+            escapeCSV(dep.type),
+            escapeCSV(dep.name),
+            escapeCSV(dep.id),
+            escapeCSV(dep.status),
+            escapeCSV(dep.details || ''),
+            'No',
+            '',
+            '',
+            'Yes',
+            'No'
+          ].join(','));
         }
-        return str;
-      };
-
-      const canAutoDelete = dep.type === 'Filter Activity' ? 'Check Required' : 'No';
-
-      rows.push([
-        escapeCSV(de.name),
-        escapeCSV(de.customerKey),
-        escapeCSV(dep.type),
-        escapeCSV(dep.name),
-        escapeCSV(dep.id),
-        escapeCSV(dep.status),
-        escapeCSV(dep.details || dep.reason || ''),
-        escapeCSV(canAutoDelete)
-      ].join(','));
+      } else {
+        // Non-filter dependencies (always blocking)
+        rows.push([
+          escapeCSV(de.name),
+          escapeCSV(de.customerKey),
+          escapeCSV(dep.type),
+          escapeCSV(dep.name),
+          escapeCSV(dep.id),
+          escapeCSV(dep.status),
+          escapeCSV(dep.details || ''),
+          'N/A',
+          '',
+          '',
+          'No',
+          'Yes'
+        ].join(','));
+      }
     }
   }
 
@@ -432,7 +490,7 @@ async function handleDependenciesInteractively(desWithDeps, logger, autoDeleteFi
     }]);
 
     if (exportAnswer.exportFirst === 'export' || exportAnswer.exportFirst === 'export_abort') {
-      const csvPath = await exportDependenciesToCsv(desWithDeps, targetFolder);
+      const csvPath = await exportDependenciesToCsv(desWithDeps, targetFolder, logger);
       console.log(chalk.green(`\n✓ Dependencies exported to: ${csvPath}`));
       csvExported = true;
 
