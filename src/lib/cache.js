@@ -1,6 +1,11 @@
 /**
  * Cache Management Module
  * Stores folder structure and other metadata locally to reduce API calls
+ *
+ * Supports parallel process execution with:
+ * - Atomic writes (write to temp file, then rename)
+ * - File locking to prevent concurrent writes
+ * - Graceful handling of lock contention
  */
 
 import fs from 'fs/promises';
@@ -14,6 +19,21 @@ const CACHE_DIR = path.resolve(__dirname, '../../cache');
 // Default cache expiry: 24 hours (in milliseconds)
 const DEFAULT_CACHE_EXPIRY_MS = 24 * 60 * 60 * 1000;
 
+// Lock timeout: 30 seconds (if lock file is older than this, consider it stale)
+const LOCK_TIMEOUT_MS = 30 * 1000;
+
+// Lock retry settings
+const LOCK_RETRY_DELAY_MS = 100;
+const LOCK_MAX_RETRIES = 50; // 5 seconds total
+
+/**
+ * Sleep helper
+ * @param {number} ms - Milliseconds to sleep
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 /**
  * Ensure cache directory exists
  */
@@ -22,6 +42,81 @@ async function ensureCacheDir() {
     await fs.mkdir(CACHE_DIR, { recursive: true });
   } catch (error) {
     // Directory may already exist
+  }
+}
+
+/**
+ * Get lock file path for a cache file
+ * @param {string} cacheFilePath - Path to cache file
+ * @returns {string} Path to lock file
+ */
+function getLockFilePath(cacheFilePath) {
+  return `${cacheFilePath}.lock`;
+}
+
+/**
+ * Acquire a lock for writing to a cache file
+ * Uses exclusive file creation to ensure only one process can hold the lock
+ * @param {string} cacheFilePath - Path to cache file
+ * @returns {Promise<boolean>} True if lock acquired
+ */
+async function acquireLock(cacheFilePath) {
+  const lockPath = getLockFilePath(cacheFilePath);
+
+  for (let attempt = 0; attempt < LOCK_MAX_RETRIES; attempt++) {
+    try {
+      // Try to create lock file exclusively (fails if exists)
+      const lockData = JSON.stringify({
+        pid: process.pid,
+        timestamp: Date.now(),
+        hostname: process.env.COMPUTERNAME || process.env.HOSTNAME || 'unknown'
+      });
+
+      await fs.writeFile(lockPath, lockData, { flag: 'wx' });
+      return true; // Lock acquired
+    } catch (error) {
+      if (error.code === 'EEXIST') {
+        // Lock file exists, check if it's stale
+        try {
+          const lockContent = await fs.readFile(lockPath, 'utf-8');
+          const lockInfo = JSON.parse(lockContent);
+          const lockAge = Date.now() - lockInfo.timestamp;
+
+          if (lockAge > LOCK_TIMEOUT_MS) {
+            // Lock is stale, remove it and retry
+            try {
+              await fs.unlink(lockPath);
+              continue; // Retry immediately
+            } catch (e) {
+              // Another process may have removed it
+            }
+          }
+        } catch (e) {
+          // Lock file may have been removed, retry
+        }
+
+        // Wait before retrying
+        await sleep(LOCK_RETRY_DELAY_MS);
+      } else {
+        // Unexpected error
+        throw error;
+      }
+    }
+  }
+
+  return false; // Could not acquire lock
+}
+
+/**
+ * Release a lock
+ * @param {string} cacheFilePath - Path to cache file
+ */
+async function releaseLock(cacheFilePath) {
+  const lockPath = getLockFilePath(cacheFilePath);
+  try {
+    await fs.unlink(lockPath);
+  } catch (error) {
+    // Lock may already be released
   }
 }
 
@@ -73,32 +168,62 @@ export async function readCache(cacheType, accountId, options = {}) {
 }
 
 /**
- * Write data to cache
+ * Write data to cache with atomic write and file locking
+ * Uses write-to-temp-then-rename pattern to prevent corruption
  * @param {string} cacheType - Type of cache
  * @param {string} accountId - SFMC Account ID
  * @param {object} data - Data to cache
  * @param {object} extraMetadata - Additional metadata to store
- * @returns {Promise<void>}
+ * @returns {Promise<boolean>} True if write succeeded, false if lock couldn't be acquired
  */
 export async function writeCache(cacheType, accountId, data, extraMetadata = {}) {
   await ensureCacheDir();
   const filePath = getCacheFilePath(cacheType, accountId);
+  const tempPath = `${filePath}.${process.pid}.tmp`;
 
-  const cache = {
-    metadata: {
-      cachedAt: new Date().toISOString(),
-      accountId,
-      cacheType,
-      ...extraMetadata
-    },
-    data
-  };
+  // Try to acquire lock
+  const lockAcquired = await acquireLock(filePath);
+  if (!lockAcquired) {
+    // Another process is writing, skip this write
+    // The other process's cache will be used
+    return false;
+  }
 
-  await fs.writeFile(filePath, JSON.stringify(cache, null, 2), 'utf-8');
+  try {
+    const cache = {
+      metadata: {
+        cachedAt: new Date().toISOString(),
+        accountId,
+        cacheType,
+        pid: process.pid,
+        ...extraMetadata
+      },
+      data
+    };
+
+    // Write to temp file first
+    await fs.writeFile(tempPath, JSON.stringify(cache, null, 2), 'utf-8');
+
+    // Atomic rename (this is atomic on most filesystems)
+    await fs.rename(tempPath, filePath);
+
+    return true;
+  } catch (error) {
+    // Clean up temp file if it exists
+    try {
+      await fs.unlink(tempPath);
+    } catch (e) {
+      // Temp file may not exist
+    }
+    throw error;
+  } finally {
+    // Always release lock
+    await releaseLock(filePath);
+  }
 }
 
 /**
- * Clear specific cache
+ * Clear specific cache (with locking)
  * @param {string} cacheType - Type of cache
  * @param {string} accountId - SFMC Account ID
  * @returns {Promise<boolean>} True if cache was cleared
@@ -106,11 +231,18 @@ export async function writeCache(cacheType, accountId, data, extraMetadata = {})
 export async function clearCache(cacheType, accountId) {
   const filePath = getCacheFilePath(cacheType, accountId);
 
+  // Try to acquire lock (but don't fail if we can't)
+  const lockAcquired = await acquireLock(filePath);
+
   try {
     await fs.unlink(filePath);
     return true;
   } catch (error) {
     return false;
+  } finally {
+    if (lockAcquired) {
+      await releaseLock(filePath);
+    }
   }
 }
 

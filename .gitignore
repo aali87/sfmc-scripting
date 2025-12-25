@@ -18,6 +18,10 @@ cache/
 *.log
 npm-debug.log*
 
+# Cache lock and temp files
+*.lock
+*.tmp
+
 # OS files
 .DS_Store
 Thumbs.db
