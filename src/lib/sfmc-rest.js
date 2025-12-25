@@ -346,6 +346,116 @@ export async function getFilterActivities(logger = null) {
   }
 }
 
+/**
+ * Get filter activity details by ID
+ * @param {string} filterId - Filter Activity ID
+ * @param {object} logger - Logger instance
+ * @returns {Promise<object|null>} Filter details or null if not found
+ */
+export async function getFilterActivityDetails(filterId, logger = null) {
+  try {
+    return await makeRequest('get', `/automation/v1/filters/${filterId}`, null, null, logger);
+  } catch (error) {
+    if (logger) {
+      logger.debug(`Failed to get filter details for ${filterId}: ${error.message}`);
+    }
+    return null;
+  }
+}
+
+/**
+ * Delete a filter activity
+ * Note: This uses an undocumented endpoint following the same pattern as queries
+ * @param {string} filterId - Filter Activity ID
+ * @param {object} logger - Logger instance
+ * @returns {Promise<{success: boolean, error?: string}>} Deletion result
+ */
+export async function deleteFilterActivity(filterId, logger = null) {
+  try {
+    await makeRequest('delete', `/automation/v1/filters/${filterId}`, null, null, logger);
+
+    if (logger) {
+      logger.info(`Successfully deleted filter activity: ${filterId}`);
+    }
+
+    return { success: true };
+  } catch (error) {
+    const errorMessage = error.message || 'Unknown error';
+
+    if (logger) {
+      logger.error(`Failed to delete filter activity ${filterId}: ${errorMessage}`);
+    }
+
+    return {
+      success: false,
+      error: errorMessage
+    };
+  }
+}
+
+/**
+ * Check if a filter activity is used in any automation
+ * @param {string} filterId - Filter Activity ID
+ * @param {object[]} automations - Array of automation objects (pre-loaded)
+ * @param {object} logger - Logger instance
+ * @returns {Promise<{isUsed: boolean, automations: object[]}>} Usage info
+ */
+export async function checkFilterInAutomations(filterId, automations = null, logger = null) {
+  try {
+    // If automations not provided, fetch them
+    if (!automations) {
+      automations = await getAutomations(logger);
+    }
+
+    const usedIn = [];
+
+    for (const automation of automations) {
+      // Get full automation details to check activities
+      let automationDetails;
+      try {
+        automationDetails = await getAutomationDetails(automation.id, logger);
+      } catch (e) {
+        // Skip if can't get details
+        continue;
+      }
+
+      // Search for filter activity in automation steps
+      if (automationDetails.steps) {
+        for (const step of automationDetails.steps) {
+          if (step.activities) {
+            for (const activity of step.activities) {
+              // Filter activities have objectTypeId 303
+              // Also check the activityObjectId matches
+              if (activity.objectTypeId === 303 ||
+                  activity.activityObjectId === filterId ||
+                  (activity.id && activity.id === filterId)) {
+                usedIn.push({
+                  automationId: automation.id,
+                  automationName: automation.name,
+                  automationStatus: automation.status,
+                  stepNumber: step.stepNumber || step.step,
+                  activityName: activity.name
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return {
+      isUsed: usedIn.length > 0,
+      automations: usedIn
+    };
+  } catch (error) {
+    if (logger) {
+      logger.debug(`Error checking filter in automations: ${error.message}`);
+    }
+    // Return false on error to be safe (don't delete if unsure)
+    return { isUsed: false, automations: [], error: error.message };
+  }
+}
+
 // =============================================================================
 // Data Extract APIs
 // =============================================================================
@@ -414,6 +524,9 @@ export default {
   getJourneyDetails,
   getDataExtensionRowCount,
   getFilterActivities,
+  getFilterActivityDetails,
+  deleteFilterActivity,
+  checkFilterInAutomations,
   getDataExtracts,
   sendWebhook
 };

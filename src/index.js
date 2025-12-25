@@ -146,6 +146,11 @@ const cli = yargs(hideBin(process.argv))
           type: 'number',
           default: 10
         })
+        .option('auto-delete-filters', {
+          describe: 'Auto-delete standalone filter activities without prompting',
+          type: 'boolean',
+          default: false
+        })
         .option('refresh-cache', {
           describe: 'Force refresh folder/DE cache from SFMC API',
           type: 'boolean',
@@ -153,7 +158,8 @@ const cli = yargs(hideBin(process.argv))
         })
         .example('$0 delete-des -f "Archive"', 'Dry run - preview what would be deleted')
         .example('$0 delete-des -f "Archive" --confirm', 'Actually delete DEs')
-        .example('$0 delete-des -f "Archive" -i', 'Interactive selection mode');
+        .example('$0 delete-des -f "Archive" -i', 'Interactive selection mode')
+        .example('$0 delete-des -f "Archive" --auto-delete-filters', 'Auto-delete orphaned filters');
     },
     (argv) => {
       const args = ['--folder', argv.folder];
@@ -163,6 +169,7 @@ const cli = yargs(hideBin(process.argv))
       if (argv.skipProtected) args.push('--skip-protected');
       if (argv.olderThanDays) args.push('--older-than-days', argv.olderThanDays);
       if (argv.batchSize) args.push('--batch-size', argv.batchSize);
+      if (argv.autoDeleteFilters) args.push('--auto-delete-filters');
       if (argv.refreshCache) args.push('--refresh-cache');
       runScript('delete-data-extensions', args);
     }

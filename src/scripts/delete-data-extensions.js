@@ -35,7 +35,12 @@ import {
   filterByPattern
 } from '../lib/data-extension-service.js';
 import { batchCheckDependencies } from '../lib/dependency-service.js';
-import { sendWebhook } from '../lib/sfmc-rest.js';
+import {
+  sendWebhook,
+  deleteFilterActivity,
+  checkFilterInAutomations,
+  getAutomations
+} from '../lib/sfmc-rest.js';
 
 // Parse command line arguments
 const argv = yargs(hideBin(process.argv))
@@ -63,6 +68,11 @@ const argv = yargs(hideBin(process.argv))
   })
   .option('force-delete-with-dependencies', {
     describe: 'Delete even if dependencies exist (VERY DANGEROUS)',
+    type: 'boolean',
+    default: false
+  })
+  .option('auto-delete-filters', {
+    describe: 'Automatically delete standalone filter activities that reference DEs',
     type: 'boolean',
     default: false
   })
@@ -161,7 +171,7 @@ async function sleep(ms) {
 /**
  * Print deletion preview
  */
-function printPreview(dataExtensions, summary, backupDir) {
+function printPreview(dataExtensions, summary, backupDir, filtersToDelete = []) {
   const width = 70;
   const line = '─'.repeat(width);
 
@@ -175,6 +185,10 @@ function printPreview(dataExtensions, summary, backupDir) {
   console.log(chalk.yellow(`│`) + ` Total Records that will be PERMANENTLY DELETED: ${formatNumber(summary.totalRecords)}`.padEnd(width) + chalk.yellow(`│`));
   console.log(chalk.yellow(`│`) + ` DEs with PII: ${summary.withPii}`.padEnd(width) + chalk.yellow(`│`));
 
+  if (filtersToDelete.length > 0) {
+    console.log(chalk.yellow(`│`) + ` Filter Activities to Delete: ${filtersToDelete.length}`.padEnd(width) + chalk.yellow(`│`));
+  }
+
   if (backupDir) {
     console.log(chalk.yellow(`│`) + ` Schema Backups: ${backupDir}`.padEnd(width) + chalk.yellow(`│`));
   }
@@ -184,12 +198,25 @@ function printPreview(dataExtensions, summary, backupDir) {
 
   dataExtensions.slice(0, 20).forEach((de, i) => {
     const rowInfo = de.rowCount !== null ? ` (${formatNumber(de.rowCount)} rows)` : '';
-    const line = `   ${i + 1}. ${de.name}${rowInfo}`;
-    console.log(chalk.yellow(`│`) + line.substring(0, width).padEnd(width) + chalk.yellow(`│`));
+    const lineText = `   ${i + 1}. ${de.name}${rowInfo}`;
+    console.log(chalk.yellow(`│`) + lineText.substring(0, width).padEnd(width) + chalk.yellow(`│`));
   });
 
   if (dataExtensions.length > 20) {
     console.log(chalk.yellow(`│`) + `   ... and ${dataExtensions.length - 20} more`.padEnd(width) + chalk.yellow(`│`));
+  }
+
+  // Show filters if any
+  if (filtersToDelete.length > 0) {
+    console.log(chalk.yellow(`├${line}┤`));
+    console.log(chalk.yellow(`│`) + ' Filter Activities:'.padEnd(width) + chalk.yellow(`│`));
+    filtersToDelete.slice(0, 10).forEach((filter, i) => {
+      const lineText = `   ${i + 1}. ${filter.name}`;
+      console.log(chalk.yellow(`│`) + lineText.substring(0, width).padEnd(width) + chalk.yellow(`│`));
+    });
+    if (filtersToDelete.length > 10) {
+      console.log(chalk.yellow(`│`) + `   ... and ${filtersToDelete.length - 10} more`.padEnd(width) + chalk.yellow(`│`));
+    }
   }
 
   console.log(chalk.yellow(`└${line}┘`));
@@ -267,6 +294,168 @@ async function getConfirmation(count, nonInteractive, confirmPhrase) {
 }
 
 /**
+ * Categorize dependencies into deletable (standalone filters) and blocking (other types)
+ * @param {object} de - Data Extension with dependencies
+ * @param {object[]} automations - Pre-loaded automations for filter check
+ * @param {object} logger - Logger instance
+ * @returns {Promise<{deletableFilters: object[], blockingDeps: object[]}>}
+ */
+async function categorizeDependencies(de, automations, logger) {
+  const deletableFilters = [];
+  const blockingDeps = [];
+
+  for (const dep of de.dependencies || []) {
+    if (dep.type === 'Filter Activity') {
+      // Check if this filter is used in any automation
+      const filterId = dep.id;
+      const usageCheck = await checkFilterInAutomations(filterId, automations, logger);
+
+      if (usageCheck.isUsed) {
+        // Filter is in an automation - blocking dependency
+        blockingDeps.push({
+          ...dep,
+          reason: `Used in automation: ${usageCheck.automations.map(a => a.automationName).join(', ')}`
+        });
+      } else {
+        // Standalone filter - can be deleted
+        deletableFilters.push(dep);
+      }
+    } else {
+      // All other dependency types are blocking
+      blockingDeps.push(dep);
+    }
+  }
+
+  return { deletableFilters, blockingDeps };
+}
+
+/**
+ * Handle dependencies interactively
+ * @param {object[]} desWithDeps - DEs that have dependencies
+ * @param {object} logger - Logger instance
+ * @param {boolean} autoDeleteFilters - Auto-delete standalone filters without prompting
+ * @param {boolean} nonInteractive - Running in non-interactive mode
+ * @returns {Promise<{proceed: object[], skip: object[], filtersToDelete: object[]}>}
+ */
+async function handleDependenciesInteractively(desWithDeps, logger, autoDeleteFilters = false, nonInteractive = false) {
+  const proceed = [];
+  const skip = [];
+  const filtersToDelete = [];
+
+  // Pre-load automations for efficiency
+  console.log(chalk.gray('\nAnalyzing filter dependencies...'));
+  let automations = [];
+  try {
+    automations = await getAutomations(logger);
+  } catch (e) {
+    logger.debug(`Could not load automations: ${e.message}`);
+  }
+
+  for (const de of desWithDeps) {
+    const { deletableFilters, blockingDeps } = await categorizeDependencies(de, automations, logger);
+
+    console.log('');
+    console.log(chalk.yellow(`━━━ ${de.name} ━━━`));
+
+    // Show deletable filters (standalone)
+    if (deletableFilters.length > 0) {
+      console.log(chalk.cyan(`  Standalone Filter Activities (can be auto-deleted):`));
+      deletableFilters.forEach(f => {
+        console.log(chalk.cyan(`    • ${f.name}`));
+      });
+    }
+
+    // Show blocking dependencies
+    if (blockingDeps.length > 0) {
+      console.log(chalk.red(`  Blocking Dependencies (require manual resolution):`));
+      blockingDeps.forEach(dep => {
+        const reason = dep.reason ? ` - ${dep.reason}` : '';
+        console.log(chalk.red(`    • ${dep.type}: ${dep.name}${reason}`));
+      });
+    }
+
+    // Determine action
+    if (blockingDeps.length > 0) {
+      // Has blocking dependencies - need user decision
+      if (nonInteractive) {
+        console.log(chalk.yellow(`  → Skipping (has blocking dependencies, non-interactive mode)`));
+        skip.push(de);
+        continue;
+      }
+
+      const choices = [
+        { name: 'Skip this DE and continue with others', value: 'skip' },
+        { name: 'Force delete (ignore all dependencies)', value: 'force' },
+        { name: 'Abort entire operation', value: 'abort' }
+      ];
+
+      if (deletableFilters.length > 0) {
+        choices.unshift({
+          name: `Delete DE and ${deletableFilters.length} standalone filter(s), ignore ${blockingDeps.length} blocking dep(s)`,
+          value: 'partial'
+        });
+      }
+
+      const answer = await inquirer.prompt([{
+        type: 'list',
+        name: 'action',
+        message: 'What would you like to do?',
+        choices
+      }]);
+
+      switch (answer.action) {
+        case 'skip':
+          skip.push(de);
+          break;
+        case 'force':
+          proceed.push(de);
+          filtersToDelete.push(...deletableFilters);
+          break;
+        case 'partial':
+          proceed.push(de);
+          filtersToDelete.push(...deletableFilters);
+          break;
+        case 'abort':
+          return { proceed: [], skip: [], filtersToDelete: [], aborted: true };
+      }
+
+    } else if (deletableFilters.length > 0) {
+      // Only has standalone filters - can delete them
+      if (autoDeleteFilters || nonInteractive) {
+        console.log(chalk.green(`  → Will delete DE and ${deletableFilters.length} standalone filter(s)`));
+        proceed.push(de);
+        filtersToDelete.push(...deletableFilters);
+      } else {
+        const answer = await inquirer.prompt([{
+          type: 'list',
+          name: 'action',
+          message: 'What would you like to do?',
+          choices: [
+            { name: `Delete DE and ${deletableFilters.length} standalone filter(s) (Recommended)`, value: 'delete' },
+            { name: 'Skip this DE', value: 'skip' },
+            { name: 'Abort entire operation', value: 'abort' }
+          ]
+        }]);
+
+        switch (answer.action) {
+          case 'delete':
+            proceed.push(de);
+            filtersToDelete.push(...deletableFilters);
+            break;
+          case 'skip':
+            skip.push(de);
+            break;
+          case 'abort':
+            return { proceed: [], skip: [], filtersToDelete: [], aborted: true };
+        }
+      }
+    }
+  }
+
+  return { proceed, skip, filtersToDelete, aborted: false };
+}
+
+/**
  * Print final report
  */
 function printReport(results, auditPath, backupDir, undoPath) {
@@ -277,16 +466,25 @@ function printReport(results, auditPath, backupDir, undoPath) {
   console.log(chalk.cyan(`┌${line}┐`));
   console.log(chalk.cyan(`│`) + chalk.bold.white('                    DELETION COMPLETE').padEnd(width) + chalk.cyan(`│`));
   console.log(chalk.cyan(`├${line}┤`));
-  console.log(chalk.cyan(`│`) + ` Successfully Deleted: ${chalk.green(results.successful)}`.padEnd(width + 10) + chalk.cyan(`│`));
-  console.log(chalk.cyan(`│`) + ` Failed: ${chalk.red(results.failed)}`.padEnd(width + 10) + chalk.cyan(`│`));
+  console.log(chalk.cyan(`│`) + ` Data Extensions Deleted: ${chalk.green(results.successful)}`.padEnd(width + 10) + chalk.cyan(`│`));
+  console.log(chalk.cyan(`│`) + ` Data Extensions Failed: ${chalk.red(results.failed)}`.padEnd(width + 10) + chalk.cyan(`│`));
   console.log(chalk.cyan(`│`) + ` Skipped (protected): ${results.skipped}`.padEnd(width) + chalk.cyan(`│`));
+
+  // Show filter results if any were processed
+  if (results.filtersDeleted > 0 || results.filtersFailed > 0) {
+    console.log(chalk.cyan(`│`) + ''.padEnd(width) + chalk.cyan(`│`));
+    console.log(chalk.cyan(`│`) + ` Filter Activities Deleted: ${chalk.green(results.filtersDeleted)}`.padEnd(width + 10) + chalk.cyan(`│`));
+    if (results.filtersFailed > 0) {
+      console.log(chalk.cyan(`│`) + ` Filter Activities Failed: ${chalk.yellow(results.filtersFailed)}`.padEnd(width + 10) + chalk.cyan(`│`));
+    }
+  }
 
   if (results.failedItems && results.failedItems.length > 0) {
     console.log(chalk.cyan(`│`) + ''.padEnd(width) + chalk.cyan(`│`));
     console.log(chalk.cyan(`│`) + ' Failed Deletions:'.padEnd(width) + chalk.cyan(`│`));
     results.failedItems.forEach(item => {
-      const line = `   • ${item.name} - ${item.error}`.substring(0, width - 2);
-      console.log(chalk.cyan(`│`) + chalk.red(line.padEnd(width)) + chalk.cyan(`│`));
+      const lineText = `   • ${item.name} - ${item.error}`.substring(0, width - 2);
+      console.log(chalk.cyan(`│`) + chalk.red(lineText.padEnd(width)) + chalk.cyan(`│`));
     });
   }
 
@@ -510,6 +708,8 @@ async function runDeletion() {
     }
 
     // Check dependencies
+    let filtersToDelete = [];
+
     if (!argv.skipDependencyCheck && filteredDes.length > 0) {
       spinner.start('Checking dependencies...');
 
@@ -530,11 +730,13 @@ async function runDeletion() {
       spinner.succeed('Dependency check complete');
 
       const withDeps = filteredDes.filter(de => de.hasDependencies);
+      const withoutDeps = filteredDes.filter(de => !de.hasDependencies);
 
       if (withDeps.length > 0) {
         console.log('');
         console.log(chalk.yellow.bold(`⚠️  ${withDeps.length} DATA EXTENSION(S) HAVE DEPENDENCIES:`));
 
+        // Quick summary first
         withDeps.forEach(de => {
           console.log(chalk.yellow(`\n   ${de.name}:`));
           de.dependencies.slice(0, 5).forEach(dep => {
@@ -545,11 +747,49 @@ async function runDeletion() {
           }
         });
 
-        if (!argv.forceDeleteWithDependencies) {
-          console.log(chalk.red('\nAborting. Resolve dependencies first or use --force-delete-with-dependencies.'));
-          process.exit(2);
-        } else {
+        if (argv.forceDeleteWithDependencies) {
+          // Force mode - proceed with all
           console.log(chalk.red.bold('\n⚠️  --force-delete-with-dependencies enabled. Proceeding despite dependencies!'));
+        } else {
+          // Interactive handling
+          console.log('');
+          console.log(chalk.cyan('━'.repeat(70)));
+          console.log(chalk.cyan.bold('  DEPENDENCY RESOLUTION'));
+          console.log(chalk.cyan('━'.repeat(70)));
+          console.log(chalk.gray('  Filter Activities that are NOT part of an automation can be'));
+          console.log(chalk.gray('  automatically deleted along with their Data Extensions.'));
+          console.log(chalk.gray('  Other dependencies require manual resolution.'));
+
+          const depResult = await handleDependenciesInteractively(
+            withDeps,
+            logger,
+            argv.autoDeleteFilters,
+            argv.nonInteractive
+          );
+
+          if (depResult.aborted) {
+            console.log(chalk.yellow('\nOperation aborted by user.'));
+            auditLogger.setMetadata('aborted', true);
+            auditLogger.save(2);
+            process.exit(2);
+          }
+
+          // Update filtered list: keep DEs without deps + approved DEs with deps
+          filteredDes = [...withoutDeps, ...depResult.proceed];
+          filtersToDelete = depResult.filtersToDelete;
+
+          if (depResult.skip.length > 0) {
+            console.log(chalk.yellow(`\nSkipping ${depResult.skip.length} DE(s) with unresolved dependencies.`));
+          }
+
+          if (filtersToDelete.length > 0) {
+            console.log(chalk.cyan(`\n${filtersToDelete.length} standalone filter activity(s) will be deleted.`));
+          }
+
+          if (filteredDes.length === 0) {
+            console.log(chalk.yellow('\nNo Data Extensions remaining to delete.'));
+            process.exit(0);
+          }
         }
       }
     }
@@ -603,7 +843,7 @@ async function runDeletion() {
     });
 
     // Show preview
-    printPreview(desToDelete, summary, backupDir);
+    printPreview(desToDelete, summary, backupDir, filtersToDelete);
 
     // Dry run check
     if (argv.dryRun) {
@@ -641,8 +881,48 @@ async function runDeletion() {
       successful: 0,
       failed: 0,
       skipped: 0,
-      failedItems: []
+      failedItems: [],
+      filtersDeleted: 0,
+      filtersFailed: 0
     };
+
+    // Delete filter activities first (before their DEs)
+    if (filtersToDelete.length > 0) {
+      console.log(chalk.cyan(`\nDeleting ${filtersToDelete.length} standalone filter activity(s)...`));
+
+      for (const filter of filtersToDelete) {
+        console.log(chalk.gray(`  Deleting filter: ${filter.name}...`));
+
+        try {
+          const filterResult = await deleteFilterActivity(filter.id, logger);
+
+          if (filterResult.success) {
+            console.log(chalk.green(`    ✓ Filter deleted`));
+            results.filtersDeleted++;
+            auditLogger.addSuccess({
+              type: 'FilterActivity',
+              id: filter.id,
+              name: filter.name
+            });
+          } else {
+            console.log(chalk.yellow(`    ⚠ Filter deletion failed: ${filterResult.error}`));
+            results.filtersFailed++;
+            // Don't add to failedItems - filter failure shouldn't block DE deletion
+            logger.warn(`Filter deletion failed for ${filter.name}: ${filterResult.error}`);
+          }
+        } catch (error) {
+          console.log(chalk.yellow(`    ⚠ Filter deletion error: ${error.message}`));
+          results.filtersFailed++;
+          logger.warn(`Filter deletion error for ${filter.name}: ${error.message}`);
+        }
+
+        await sleep(config.safety.apiRateLimitDelayMs);
+      }
+
+      console.log('');
+    }
+
+    console.log(chalk.bold('Deleting Data Extensions...'));
 
     const batchSize = argv.batchSize;
     let batch = 0;
