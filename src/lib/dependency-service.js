@@ -425,26 +425,68 @@ export async function checkImportActivityDependencies(deCustomerKey, logger = nu
 
 /**
  * Check Filter Activities for DE dependencies
+ * Properly checks the filter's source/destination data extension using ObjectID
  * @param {string} deCustomerKey - DE CustomerKey
+ * @param {string} deObjectId - DE ObjectID (GUID) - optional but recommended for accurate matching
  * @param {object} logger - Logger instance
  * @returns {Promise<object[]>} Array of filter dependencies
  */
-export async function checkFilterActivityDependencies(deCustomerKey, logger = null) {
+export async function checkFilterActivityDependencies(deCustomerKey, deObjectId = null, logger = null) {
   await loadAllDependencies(logger);
 
   const dependencies = [];
   const keyLower = deCustomerKey.toLowerCase();
+  const objectIdLower = deObjectId ? deObjectId.toLowerCase() : null;
 
   for (const filter of dependencyCache.filterActivities) {
-    // Search filter configuration for DE reference
-    const configString = JSON.stringify(filter).toLowerCase();
-    if (configString.includes(keyLower)) {
+    let isMatch = false;
+    let matchDetails = [];
+
+    // Primary check: Compare sourceObjectId against DE's ObjectID
+    // This is the most reliable way to match - sourceObjectId is the GUID of the source DE
+    if (objectIdLower && filter.sourceObjectId) {
+      if (filter.sourceObjectId.toLowerCase() === objectIdLower) {
+        isMatch = true;
+        matchDetails.push('Source DE');
+      }
+    }
+
+    // Also check destinationObjectId - filter may write to this DE
+    if (objectIdLower && filter.destinationObjectId) {
+      if (filter.destinationObjectId.toLowerCase() === objectIdLower) {
+        isMatch = true;
+        matchDetails.push('Destination DE');
+      }
+    }
+
+    // Fallback checks using CustomerKey (for cases where ObjectID is not available)
+    // These are less reliable but provide backwards compatibility
+
+    // Check customerKey field on filter (some filters may have this)
+    if (!isMatch && filter.customerKey && filter.customerKey.toLowerCase() === keyLower) {
+      isMatch = true;
+      matchDetails.push('CustomerKey match');
+    }
+
+    // Check sourceObjectKey if it exists
+    if (!isMatch && filter.sourceObjectKey && filter.sourceObjectKey.toLowerCase() === keyLower) {
+      isMatch = true;
+      matchDetails.push('Source key match');
+    }
+
+    // Check dataExtensionKey if it exists
+    if (!isMatch && filter.dataExtensionKey && filter.dataExtensionKey.toLowerCase() === keyLower) {
+      isMatch = true;
+      matchDetails.push('DE key match');
+    }
+
+    if (isMatch) {
       dependencies.push({
         type: 'Filter Activity',
-        id: filter.id || filter.filterId,
+        id: filter.filterActivityId || filter.id || filter.filterId,
         name: filter.name,
-        status: filter.status,
-        details: 'Referenced in filter configuration'
+        status: filter.statusId === 1 ? 'Active' : `Status ${filter.statusId}`,
+        details: matchDetails.join(', ')
       });
     }
   }
@@ -483,10 +525,11 @@ export async function checkDataExtractDependencies(deCustomerKey, logger = null)
 /**
  * Run all dependency checks for a Data Extension
  * @param {string} deCustomerKey - DE CustomerKey
+ * @param {string} deObjectId - DE ObjectID (GUID) - optional but recommended for filter matching
  * @param {object} logger - Logger instance
  * @returns {Promise<object>} Consolidated dependency report
  */
-export async function checkAllDependencies(deCustomerKey, logger = null) {
+export async function checkAllDependencies(deCustomerKey, deObjectId = null, logger = null) {
   // Load all dependency data once
   await loadAllDependencies(logger);
 
@@ -505,7 +548,7 @@ export async function checkAllDependencies(deCustomerKey, logger = null) {
     checkTriggeredSendDependencies(deCustomerKey, logger),
     checkQueryActivityDependencies(deCustomerKey, logger),
     checkImportActivityDependencies(deCustomerKey, logger),
-    checkFilterActivityDependencies(deCustomerKey, logger),
+    checkFilterActivityDependencies(deCustomerKey, deObjectId, logger),
     checkDataExtractDependencies(deCustomerKey, logger)
   ]);
 
@@ -557,27 +600,33 @@ export async function checkAllDependencies(deCustomerKey, logger = null) {
 /**
  * Batch check dependencies for multiple DEs
  * More efficient than calling checkAllDependencies for each
- * @param {string[]} customerKeys - Array of DE CustomerKeys
+ * @param {object[]|string[]} dataExtensions - Array of DE objects with {customerKey, objectId} or just customerKeys for backwards compatibility
  * @param {object} logger - Logger instance
  * @param {function} onProgress - Progress callback (current, total, de)
  * @returns {Promise<Map<string, object>>} Map of CustomerKey to dependency report
  */
-export async function batchCheckDependencies(customerKeys, logger = null, onProgress = null) {
+export async function batchCheckDependencies(dataExtensions, logger = null, onProgress = null) {
   // Load all dependency data once
   await loadAllDependencies(logger, true); // Force refresh for batch
 
   const results = new Map();
   let current = 0;
 
-  for (const key of customerKeys) {
+  for (const de of dataExtensions) {
     current++;
+
+    // Support both object format {customerKey, objectId} and string format (just customerKey)
+    const isObject = typeof de === 'object' && de !== null;
+    const customerKey = isObject ? de.customerKey : de;
+    const objectId = isObject ? de.objectId : null;
+
     if (onProgress) {
-      onProgress(current, customerKeys.length, key);
+      onProgress(current, dataExtensions.length, customerKey);
     }
 
     // Since data is cached, these are fast
-    const report = await checkAllDependencies(key, logger);
-    results.set(key, report);
+    const report = await checkAllDependencies(customerKey, objectId, logger);
+    results.set(customerKey, report);
   }
 
   return results;

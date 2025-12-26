@@ -230,6 +230,120 @@ export async function getAutomationDetails(automationId, logger = null) {
   return makeRequest('get', `/automation/v1/automations/${automationId}`, null, null, logger);
 }
 
+/**
+ * Get automation by name
+ * @param {string} automationName - Automation name to search for
+ * @param {object[]} automations - Pre-loaded automations (optional)
+ * @param {object} logger - Logger instance
+ * @returns {Promise<object|null>} Automation object or null if not found
+ */
+export async function getAutomationByName(automationName, automations = null, logger = null) {
+  try {
+    if (!automations) {
+      automations = await getAutomations(logger);
+    }
+
+    const nameLower = automationName.toLowerCase().trim();
+    const automation = automations.find(a =>
+      a.name && a.name.toLowerCase().trim() === nameLower
+    );
+
+    return automation || null;
+  } catch (error) {
+    if (logger) {
+      logger.debug(`Error finding automation by name: ${error.message}`);
+    }
+    return null;
+  }
+}
+
+/**
+ * Get automation with full metadata including last run info
+ * Returns: id, name, description, status, createdDate, modifiedDate, lastRunTime, lastRunInstanceId
+ * @param {string} automationId - Automation ID
+ * @param {object} logger - Logger instance
+ * @returns {Promise<object>} Automation with full metadata
+ */
+export async function getAutomationWithMetadata(automationId, logger = null) {
+  try {
+    const automation = await getAutomationDetails(automationId, logger);
+
+    // The REST API returns these fields directly:
+    // - createdDate
+    // - modifiedDate
+    // - lastRunTime
+    // - lastRunInstanceId
+    // - status/statusId
+
+    return {
+      id: automation.id,
+      name: automation.name,
+      description: automation.description,
+      key: automation.key,
+      status: automation.status,
+      statusId: automation.statusId,
+      createdDate: automation.createdDate,
+      modifiedDate: automation.modifiedDate,
+      lastRunTime: automation.lastRunTime,
+      lastRunInstanceId: automation.lastRunInstanceId,
+      categoryId: automation.categoryId,
+      steps: automation.steps,
+      // Full object for backup purposes
+      _raw: automation
+    };
+  } catch (error) {
+    if (logger) {
+      logger.debug(`Failed to get automation metadata for ${automationId}: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Delete an automation
+ * Note: This uses an undocumented endpoint - use with caution
+ * @param {string} automationId - Automation ID
+ * @param {object} logger - Logger instance
+ * @returns {Promise<{success: boolean, error?: string}>} Deletion result
+ */
+export async function deleteAutomation(automationId, logger = null) {
+  try {
+    await makeRequest('delete', `/automation/v1/automations/${automationId}`, null, null, logger);
+
+    if (logger) {
+      logger.info(`Successfully deleted automation: ${automationId}`);
+    }
+
+    return { success: true };
+  } catch (error) {
+    const errorMessage = error.message || 'Unknown error';
+
+    if (logger) {
+      logger.error(`Failed to delete automation ${automationId}: ${errorMessage}`);
+    }
+
+    return {
+      success: false,
+      error: errorMessage
+    };
+  }
+}
+
+/**
+ * Backup automation configuration to JSON
+ * @param {object} automation - Full automation object
+ * @returns {object} Backup data structure
+ */
+export function createAutomationBackup(automation) {
+  return {
+    backupDate: new Date().toISOString(),
+    automationId: automation.id,
+    automationName: automation.name,
+    automationKey: automation.key,
+    configuration: automation._raw || automation
+  };
+}
+
 // =============================================================================
 // Journey Builder APIs
 // =============================================================================
@@ -520,6 +634,10 @@ export async function sendWebhook(url, payload, logger = null) {
 export default {
   getAutomations,
   getAutomationDetails,
+  getAutomationByName,
+  getAutomationWithMetadata,
+  deleteAutomation,
+  createAutomationBackup,
   getJourneys,
   getJourneyDetails,
   getDataExtensionRowCount,

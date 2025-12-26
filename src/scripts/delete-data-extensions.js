@@ -39,7 +39,8 @@ import {
   sendWebhook,
   deleteFilterActivity,
   checkFilterInAutomations,
-  getAutomations
+  getAutomations,
+  getAutomationWithMetadata
 } from '../lib/sfmc-rest.js';
 
 // Parse command line arguments
@@ -332,7 +333,24 @@ async function exportDependenciesToCsv(desWithDeps, targetFolder, logger = null)
     return str;
   };
 
-  // CSV header - expanded to include automation usage details
+  // Cache for automation metadata to avoid repeated API calls
+  const automationMetadataCache = new Map();
+
+  // Helper to get automation metadata with caching
+  const getAutomationMetadataCached = async (automationId) => {
+    if (automationMetadataCache.has(automationId)) {
+      return automationMetadataCache.get(automationId);
+    }
+    try {
+      const metadata = await getAutomationWithMetadata(automationId, logger);
+      automationMetadataCache.set(automationId, metadata);
+      return metadata;
+    } catch (e) {
+      return null;
+    }
+  };
+
+  // CSV header - expanded to include automation usage details and metadata
   const header = [
     'Data Extension Name',
     'Data Extension CustomerKey',
@@ -344,6 +362,8 @@ async function exportDependenciesToCsv(desWithDeps, targetFolder, logger = null)
     'Used In Automation',
     'Automation Name',
     'Automation Status',
+    'Automation Created Date',
+    'Automation Last Run Time',
     'Can Auto-Delete',
     'Blocking'
   ].join(',');
@@ -359,6 +379,9 @@ async function exportDependenciesToCsv(desWithDeps, targetFolder, logger = null)
         if (usageCheck.isUsed && usageCheck.automations.length > 0) {
           // Add a row for each automation the filter is used in
           for (const automation of usageCheck.automations) {
+            // Get additional automation metadata
+            const metadata = await getAutomationMetadataCached(automation.automationId);
+
             rows.push([
               escapeCSV(de.name),
               escapeCSV(de.customerKey),
@@ -370,6 +393,8 @@ async function exportDependenciesToCsv(desWithDeps, targetFolder, logger = null)
               'Yes',
               escapeCSV(automation.automationName),
               escapeCSV(automation.automationStatus),
+              escapeCSV(metadata?.createdDate || ''),
+              escapeCSV(metadata?.lastRunTime || ''),
               'No',
               'Yes'
             ].join(','));
@@ -387,6 +412,8 @@ async function exportDependenciesToCsv(desWithDeps, targetFolder, logger = null)
             'No',
             '',
             '',
+            '',
+            '',
             'Yes',
             'No'
           ].join(','));
@@ -402,6 +429,8 @@ async function exportDependenciesToCsv(desWithDeps, targetFolder, logger = null)
           escapeCSV(dep.status),
           escapeCSV(dep.details || ''),
           'N/A',
+          '',
+          '',
           '',
           '',
           'No',
@@ -899,8 +928,9 @@ async function runDeletion() {
     if (!argv.skipDependencyCheck && filteredDes.length > 0) {
       spinner.start('Checking dependencies...');
 
-      const customerKeys = filteredDes.map(de => de.customerKey);
-      const dependencyResults = await batchCheckDependencies(customerKeys, logger, (current, total, key) => {
+      // Pass DE objects with both customerKey and objectId for accurate filter matching
+      const deObjects = filteredDes.map(de => ({ customerKey: de.customerKey, objectId: de.objectId }));
+      const dependencyResults = await batchCheckDependencies(deObjects, logger, (current, total, key) => {
         spinner.text = `Checking dependencies: ${current}/${total}`;
       });
 
