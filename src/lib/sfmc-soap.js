@@ -426,10 +426,11 @@ export async function retrieveDataExtensionFields(deCustomerKey, logger = null) 
  * @returns {Promise<object[]>} Array of TSD objects
  */
 export async function retrieveTriggeredSendDefinitions(logger = null) {
+  // Valid TriggeredSendDefinition properties (SFMC SOAP API)
   const properties = [
     'ObjectID', 'CustomerKey', 'Name', 'Description', 'TriggeredSendStatus',
-    'Email.ID', 'List.ID', 'SendableDataExtensionField.Name',
-    'SendableSubscriberField.Name', 'CreatedDate', 'ModifiedDate'
+    'Email.ID', 'List.ID', 'CreatedDate', 'ModifiedDate',
+    'SendClassification.CustomerKey', 'SenderProfile.CustomerKey'
   ];
 
   return retrieve('TriggeredSendDefinition', properties, null, logger);
@@ -440,14 +441,71 @@ export async function retrieveTriggeredSendDefinitions(logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<object[]>} Array of query objects
  */
-export async function retrieveQueryDefinitions(logger = null) {
+export async function retrieveQueryDefinitions(logger = null, includeQueryText = false) {
+  // Valid QueryDefinition properties (SFMC SOAP API)
+  // NOTE: QueryText is excluded from bulk retrieval by default as it can cause SFMC to return
+  // HTML error pages instead of SOAP responses when there's a lot of data.
   const properties = [
-    'ObjectID', 'CustomerKey', 'Name', 'Description', 'QueryText',
-    'TargetType', 'TargetUpdateType', 'DataExtensionTarget.CustomerKey',
-    'DataExtensionTarget.Name', 'CategoryID', 'Status', 'CreatedDate', 'ModifiedDate'
+    'ObjectID', 'CustomerKey', 'Name', 'Description',
+    'TargetType', 'TargetUpdateType', 'CategoryID'
   ];
 
+  if (includeQueryText) {
+    properties.push('QueryText');
+  }
+
   return retrieve('QueryDefinition', properties, null, logger);
+}
+
+/**
+ * Retrieve QueryText for specific queries by ObjectID
+ * Use this to load SQL for specific queries after initial bulk load
+ * @param {string[]} objectIds - Array of query ObjectIDs to fetch
+ * @param {object} logger - Logger instance
+ * @returns {Promise<Map<string, string>>} Map of ObjectID -> QueryText
+ */
+export async function retrieveQueryTexts(objectIds, logger = null, concurrency = 10) {
+  if (!objectIds || objectIds.length === 0) {
+    return new Map();
+  }
+
+  const results = new Map();
+
+  // Process in parallel with controlled concurrency
+  // This is much faster than sequential but still avoids overwhelming the API
+  const fetchQueryText = async (objectId) => {
+    const filter = buildSimpleFilter('ObjectID', 'equals', objectId);
+
+    try {
+      const queries = await retrieve(
+        'QueryDefinition',
+        ['ObjectID', 'QueryText'],
+        filter,
+        null // Don't pass logger to avoid flooding logs
+      );
+
+      for (const q of queries) {
+        if (q.ObjectID && q.QueryText) {
+          results.set(q.ObjectID, q.QueryText);
+        }
+      }
+    } catch (err) {
+      // Silently skip failures - some queries may not have text or may be inaccessible
+    }
+  };
+
+  // Process in chunks with concurrency limit
+  for (let i = 0; i < objectIds.length; i += concurrency) {
+    const chunk = objectIds.slice(i, i + concurrency);
+    await Promise.all(chunk.map(fetchQueryText));
+
+    // Brief pause between chunks to be gentle on the API
+    if (i + concurrency < objectIds.length) {
+      await sleep(100);
+    }
+  }
+
+  return results;
 }
 
 /**
@@ -456,10 +514,12 @@ export async function retrieveQueryDefinitions(logger = null) {
  * @returns {Promise<object[]>} Array of import definition objects
  */
 export async function retrieveImportDefinitions(logger = null) {
+  // Valid ImportDefinition properties (SFMC SOAP API)
+  // DestinationObject.ObjectID returns the DE's ObjectID
   const properties = [
     'ObjectID', 'CustomerKey', 'Name', 'Description',
-    'DestinationObject.ObjectID', 'DestinationObject.CustomerKey',
-    'UpdateType', 'FileSpec', 'CategoryID', 'Status', 'CreatedDate', 'ModifiedDate'
+    'DestinationObject.ObjectID',
+    'UpdateType', 'FileSpec', 'FieldMappingType', 'FileType'
   ];
 
   return retrieve('ImportDefinition', properties, null, logger);
@@ -496,6 +556,7 @@ export default {
   retrieveDataExtensionFields,
   retrieveTriggeredSendDefinitions,
   retrieveQueryDefinitions,
+  retrieveQueryTexts,
   retrieveImportDefinitions,
   deleteDataExtension,
   deleteFolder,
