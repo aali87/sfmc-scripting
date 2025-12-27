@@ -25,7 +25,13 @@ import { createLogger, createAuditLogger } from '../lib/logger.js';
 import { testConnection } from '../lib/sfmc-auth.js';
 import { getFolderByPath, getFolderByName, getSubfolders, getFolderTree, findSimilarFolders, clearFolderCache } from '../lib/folder-service.js';
 import { getDataExtensionsInFolder, getFullDataExtensionDetails } from '../lib/data-extension-service.js';
-import { batchCheckDependencies } from '../lib/dependency-service.js';
+import {
+  analyzeDependencies,
+  formatAnalysisReport,
+  exportReportToCsv,
+  exportDeDependenciesToCsv,
+  DependencyClassification
+} from '../lib/dependency-analyzer.js';
 
 // Parse command line arguments
 const argv = yargs(hideBin(process.argv))
@@ -152,6 +158,26 @@ function printSummary(summary) {
   console.log(`│ DEs with PII Fields             │ ${String(summary.dataExtensionsWithPII).padStart(9)} │`);
   console.log(`│ Protected DEs (would be skipped)│ ${String(summary.protectedItemsFound).padStart(9)} │`);
   console.log('└─────────────────────────────────┴───────────┘');
+
+  // Smart analysis summary
+  if (summary.dependencyAnalysis) {
+    const da = summary.dependencyAnalysis;
+    console.log('');
+    console.log(chalk.bold('🔍 SMART DEPENDENCY ANALYSIS'));
+    console.log('┌─────────────────────────────────┬───────────┐');
+    console.log(`│ Total Unique Dependencies       │ ${String(da.totalUniqueDependencies).padStart(9)} │`);
+    console.log(`│ ${chalk.green('✓ Safe to Delete')}                │ ${chalk.green(String(da.safeToDelete).padStart(9))} │`);
+    console.log(`│ ${chalk.yellow('⚠ Requires Review')}               │ ${chalk.yellow(String(da.requiresReview).padStart(9))} │`);
+    console.log('├─────────────────────────────────┴───────────┤');
+    console.log('│ By Type:                                    │');
+
+    for (const [type, counts] of Object.entries(da.byType)) {
+      const typeStr = `   ${type}`.padEnd(25);
+      const countStr = `${counts.safeToDelete}/${counts.total} safe`;
+      console.log(`│${typeStr} ${countStr.padStart(18)} │`);
+    }
+    console.log('└─────────────────────────────────────────────┘');
+  }
 }
 
 /**
@@ -253,46 +279,72 @@ function saveJsonOutput(auditData) {
 }
 
 /**
- * Save CSV output
+ * Save CSV output with smart analysis data
  */
-function saveCsvOutput(dataExtensions, folders) {
+function saveCsvOutput(dataExtensions, folders, dependencyReport) {
   const timestamp = dayjs().format('YYYYMMDD-HHmmss');
-  const filename = `audit-${timestamp}.csv`;
-  const filePath = path.join(config.paths.audit, filename);
 
   // Ensure directory exists
   if (!fs.existsSync(config.paths.audit)) {
     fs.mkdirSync(config.paths.audit, { recursive: true });
   }
 
-  // Build CSV
-  const headers = [
-    'FolderPath', 'DEName', 'CustomerKey', 'RowCount', 'HasPII',
-    'PIIFieldCount', 'CreatedDate', 'ModifiedDate', 'DependencyCount', 'DependencyDetails'
-  ];
+  const savedFiles = [];
 
-  const rows = dataExtensions.map(de => {
-    const folder = folders.find(f => f.id === de.folderId);
-    const folderPath = folder?.path || '';
-    const depDetails = (de.dependencies || []).map(d => `${d.type}:${d.name}`).join('; ');
+  // 1. Save DE-centric CSV (main audit file)
+  const deFilename = `audit-des-${timestamp}.csv`;
+  const deFilePath = path.join(config.paths.audit, deFilename);
 
-    return [
-      `"${folderPath}"`,
-      `"${de.name}"`,
-      `"${de.customerKey}"`,
-      de.rowCount || 0,
-      de.hasPii ? 'Yes' : 'No',
-      de.piiFields?.length || 0,
-      de.createdDate || '',
-      de.modifiedDate || '',
-      de.dependencyCount || 0,
-      `"${depDetails}"`
-    ].join(',');
-  });
+  // Prepare DEs with folder path for CSV export
+  const desWithPath = dataExtensions.map(de => ({
+    ...de,
+    folderPath: folders.find(f => f.id === de.folderId)?.path || ''
+  }));
 
-  const csv = [headers.join(','), ...rows].join('\n');
-  fs.writeFileSync(filePath, csv);
-  return filePath;
+  if (dependencyReport) {
+    // Use smart CSV export
+    const deCsv = exportDeDependenciesToCsv(desWithPath, dependencyReport);
+    fs.writeFileSync(deFilePath, deCsv);
+  } else {
+    // Fallback to basic CSV if no dependency analysis
+    const headers = [
+      'FolderPath', 'DEName', 'CustomerKey', 'RowCount', 'HasPII',
+      'PIIFieldCount', 'CreatedDate', 'ModifiedDate', 'DependencyCount'
+    ];
+
+    const rows = dataExtensions.map(de => {
+      const folder = folders.find(f => f.id === de.folderId);
+      const folderPath = folder?.path || '';
+
+      return [
+        `"${folderPath}"`,
+        `"${de.name}"`,
+        `"${de.customerKey}"`,
+        de.rowCount || 0,
+        de.hasPii ? 'Yes' : 'No',
+        de.piiFields?.length || 0,
+        de.createdDate || '',
+        de.modifiedDate || '',
+        de.dependencyCount || 0
+      ].join(',');
+    });
+
+    const csv = [headers.join(','), ...rows].join('\n');
+    fs.writeFileSync(deFilePath, csv);
+  }
+  savedFiles.push(deFilePath);
+
+  // 2. Save dependency-centric CSV (if we have analysis)
+  if (dependencyReport && dependencyReport.all.length > 0) {
+    const depFilename = `audit-dependencies-${timestamp}.csv`;
+    const depFilePath = path.join(config.paths.audit, depFilename);
+
+    const depCsv = exportReportToCsv(dependencyReport);
+    fs.writeFileSync(depFilePath, depCsv);
+    savedFiles.push(depFilePath);
+  }
+
+  return savedFiles;
 }
 
 /**
@@ -392,27 +444,46 @@ async function runAudit() {
       spinner.succeed('Data Extension details gathered');
     }
 
-    // Check dependencies
+    // Check dependencies using smart analysis
+    let dependencyReport = null;
     if (argv.checkDependencies && allDataExtensions.length > 0) {
-      spinner.start('Checking dependencies...');
+      spinner.start('Running smart dependency analysis...');
 
-      const customerKeys = allDataExtensions.map(de => de.customerKey);
-      const dependencyResults = await batchCheckDependencies(customerKeys, logger, (current, total, key) => {
-        spinner.text = `Checking dependencies: ${current}/${total} - ${key}`;
+      // Prepare DE objects for analysis (need customerKey, objectId, name)
+      const desForAnalysis = allDataExtensions.map(de => ({
+        customerKey: de.customerKey,
+        objectId: de.objectId,
+        name: de.name
+      }));
+
+      dependencyReport = await analyzeDependencies(desForAnalysis, {
+        logger,
+        onProgress: (stage, current, total, message) => {
+          spinner.text = `${message}`;
+        }
       });
 
       // Merge dependency info into DE objects
       for (const de of allDataExtensions) {
-        const depInfo = dependencyResults.get(de.customerKey);
-        if (depInfo) {
-          de.hasDependencies = depInfo.hasDependencies;
-          de.dependencyCount = depInfo.totalCount;
-          de.dependencies = depInfo.all;
-          de.dependencySummary = depInfo.summary;
-        }
+        const deDeps = dependencyReport.deMapping?.get(de.customerKey) || [];
+        de.hasDependencies = deDeps.length > 0;
+        de.dependencyCount = deDeps.length;
+        de.dependencies = deDeps.map(ref => {
+          // Find full dependency info
+          const fullDep = dependencyReport.all.find(d => d.type === ref.type && d.id === ref.id);
+          return fullDep || ref;
+        });
+
+        // Count safe vs blocking
+        de.safeToDeleteDeps = de.dependencies.filter(d =>
+          d.classification === DependencyClassification.SAFE_TO_DELETE
+        ).length;
+        de.blockingDeps = de.dependencies.filter(d =>
+          d.classification !== DependencyClassification.SAFE_TO_DELETE
+        ).length;
       }
 
-      spinner.succeed('Dependency check complete');
+      spinner.succeed(`Dependency analysis complete: ${dependencyReport.summary.safeToDelete} safe, ${dependencyReport.summary.requiresReview} require review`);
     }
 
     // Update DE map with enriched data
@@ -429,7 +500,14 @@ async function runAudit() {
       dataExtensionsWithDependencies: allDataExtensions.filter(de => de.hasDependencies).length,
       dataExtensionsWithPII: allDataExtensions.filter(de => de.hasPii).length,
       protectedItemsFound: allDataExtensions.filter(de => de.isProtected).length +
-                          allFolders.filter(f => f.isProtected).length
+                          allFolders.filter(f => f.isProtected).length,
+      // Smart analysis summary
+      dependencyAnalysis: dependencyReport ? {
+        totalUniqueDependencies: dependencyReport.summary.uniqueDependencies,
+        safeToDelete: dependencyReport.summary.safeToDelete,
+        requiresReview: dependencyReport.summary.requiresReview,
+        byType: dependencyReport.summary.byType
+      } : null
     };
 
     // Build audit data for JSON output
@@ -483,7 +561,14 @@ async function runAudit() {
       printFolderTree(folderTree, deByFolder);
 
       printSummary(summary);
-      printDependencies(allDataExtensions);
+
+      // Print smart analysis report if available
+      if (dependencyReport) {
+        console.log(formatAnalysisReport(dependencyReport));
+      } else {
+        printDependencies(allDataExtensions);
+      }
+
       printProtectedItems(allDataExtensions, allFolders);
       printDeList(allDataExtensions);
     }
@@ -497,10 +582,12 @@ async function runAudit() {
     }
 
     // CSV output
-    let csvPath = null;
+    let csvPaths = [];
     if (argv.output === 'csv' || argv.output === 'all') {
-      csvPath = saveCsvOutput(allDataExtensions, allFolders);
-      console.log(chalk.green(`📄 CSV report saved: ${csvPath}`));
+      csvPaths = saveCsvOutput(allDataExtensions, allFolders, dependencyReport);
+      for (const csvPath of csvPaths) {
+        console.log(chalk.green(`📄 CSV report saved: ${csvPath}`));
+      }
     }
 
     // Final summary

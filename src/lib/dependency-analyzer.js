@@ -731,9 +731,167 @@ export function formatAnalysisReport(report) {
   return lines.join('\n');
 }
 
+/**
+ * Export analysis report to CSV format
+ *
+ * @param {object} report - Analysis report from analyzeDependencies
+ * @param {object} options - Export options
+ * @param {boolean} options.includeAffectedDes - Include list of affected DEs (default: true)
+ * @returns {string} CSV content
+ */
+export function exportReportToCsv(report, options = {}) {
+  const { includeAffectedDes = true } = options;
+
+  // Escape CSV values
+  const escapeCSV = (val) => {
+    if (val === null || val === undefined) return '';
+    const str = String(val);
+    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  };
+
+  // CSV header
+  const headers = [
+    'Dependency Type',
+    'Dependency Name',
+    'Dependency ID',
+    'Status',
+    'Classification',
+    'Recommendation',
+    'Reason',
+    'Last Run Time',
+    'Days Since Last Run',
+    'Affected DE Count'
+  ];
+
+  if (includeAffectedDes) {
+    headers.push('Affected DEs');
+  }
+
+  const rows = [headers.join(',')];
+
+  // Process all dependencies
+  for (const dep of report.all) {
+    // Map classification to recommendation
+    let recommendation = 'Review Required';
+    if (dep.classification === DependencyClassification.SAFE_TO_DELETE) {
+      recommendation = 'Safe to Delete';
+    } else if (dep.classification === DependencyClassification.UNKNOWN) {
+      recommendation = 'Unknown - Manual Review';
+    }
+
+    const row = [
+      escapeCSV(dep.type),
+      escapeCSV(dep.name),
+      escapeCSV(dep.id),
+      escapeCSV(dep.status),
+      escapeCSV(dep.classification),
+      escapeCSV(recommendation),
+      escapeCSV(dep.classificationReason),
+      escapeCSV(dep.metadata?.lastRunTime || ''),
+      escapeCSV(dep.metadata?.daysSinceLastRun ?? ''),
+      escapeCSV(dep.affectedDes?.length || 0)
+    ];
+
+    if (includeAffectedDes) {
+      const deList = (dep.affectedDes || []).map(de => de.name || de.customerKey).join('; ');
+      row.push(escapeCSV(deList));
+    }
+
+    rows.push(row.join(','));
+  }
+
+  return rows.join('\n');
+}
+
+/**
+ * Export DE-centric view to CSV (one row per DE with dependency summary)
+ *
+ * @param {object[]} dataExtensions - Array of DE objects with dependency info
+ * @param {object} report - Analysis report from analyzeDependencies
+ * @returns {string} CSV content
+ */
+export function exportDeDependenciesToCsv(dataExtensions, report) {
+  const escapeCSV = (val) => {
+    if (val === null || val === undefined) return '';
+    const str = String(val);
+    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  };
+
+  const headers = [
+    'DE Name',
+    'DE CustomerKey',
+    'Folder Path',
+    'Row Count',
+    'Total Dependencies',
+    'Safe to Delete',
+    'Requires Review',
+    'Blocking Dependencies',
+    'Recommendation',
+    'Dependency Details'
+  ];
+
+  const rows = [headers.join(',')];
+
+  for (const de of dataExtensions) {
+    // Get dependencies for this DE from the report mapping
+    const deDeps = report.deMapping?.get(de.customerKey) || [];
+
+    // Count by classification
+    let safeCount = 0;
+    let reviewCount = 0;
+    const blockingDeps = [];
+
+    for (const depRef of deDeps) {
+      // Find the full dependency info from report.all
+      const fullDep = report.all.find(d => d.type === depRef.type && d.id === depRef.id);
+      if (fullDep) {
+        if (fullDep.classification === DependencyClassification.SAFE_TO_DELETE) {
+          safeCount++;
+        } else {
+          reviewCount++;
+          blockingDeps.push(`${fullDep.type}: ${fullDep.name}`);
+        }
+      }
+    }
+
+    // Determine overall recommendation
+    let recommendation = 'Safe to Delete';
+    if (reviewCount > 0) {
+      recommendation = 'Review Required - Has Blocking Dependencies';
+    } else if (safeCount > 0) {
+      recommendation = 'Safe to Delete (dependencies can be auto-deleted)';
+    }
+
+    const row = [
+      escapeCSV(de.name),
+      escapeCSV(de.customerKey),
+      escapeCSV(de.folderPath || ''),
+      escapeCSV(de.rowCount ?? ''),
+      escapeCSV(deDeps.length),
+      escapeCSV(safeCount),
+      escapeCSV(reviewCount),
+      escapeCSV(blockingDeps.slice(0, 5).join('; ') + (blockingDeps.length > 5 ? ` (+${blockingDeps.length - 5} more)` : '')),
+      escapeCSV(recommendation),
+      escapeCSV(deDeps.map(d => `${d.type}: ${d.name}`).slice(0, 10).join('; ') + (deDeps.length > 10 ? ` (+${deDeps.length - 10} more)` : ''))
+    ];
+
+    rows.push(row.join(','));
+  }
+
+  return rows.join('\n');
+}
+
 export default {
   analyzeDependencies,
   formatAnalysisReport,
+  exportReportToCsv,
+  exportDeDependenciesToCsv,
   DependencyClassification,
   ClassificationReason
 };

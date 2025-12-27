@@ -34,7 +34,13 @@ import {
   filterByDate,
   filterByPattern
 } from '../lib/data-extension-service.js';
-import { batchCheckDependencies } from '../lib/dependency-service.js';
+import {
+  analyzeDependencies,
+  formatAnalysisReport,
+  exportReportToCsv,
+  exportDeDependenciesToCsv,
+  DependencyClassification
+} from '../lib/dependency-analyzer.js';
 import {
   sendWebhook,
   deleteFilterActivity,
@@ -74,6 +80,11 @@ const argv = yargs(hideBin(process.argv))
   })
   .option('auto-delete-filters', {
     describe: 'Automatically delete standalone filter activities that reference DEs',
+    type: 'boolean',
+    default: false
+  })
+  .option('delete-safe-dependencies', {
+    describe: 'Auto-delete dependencies classified as safe (standalone filters, stale automations)',
     type: 'boolean',
     default: false
   })
@@ -922,79 +933,127 @@ async function runDeletion() {
       }
     }
 
-    // Check dependencies
+    // Check dependencies using smart analysis
     let filtersToDelete = [];
+    let dependenciesToDelete = []; // Safe dependencies that will be auto-deleted
+    let dependencyReport = null;
 
     if (!argv.skipDependencyCheck && filteredDes.length > 0) {
-      spinner.start('Checking dependencies...');
+      spinner.start('Running smart dependency analysis...');
 
-      // Pass DE objects with both customerKey and objectId for accurate filter matching
-      const deObjects = filteredDes.map(de => ({ customerKey: de.customerKey, objectId: de.objectId }));
-      const dependencyResults = await batchCheckDependencies(deObjects, logger, (current, total, key) => {
-        spinner.text = `Checking dependencies: ${current}/${total}`;
+      // Prepare DE objects for analysis
+      const desForAnalysis = filteredDes.map(de => ({
+        customerKey: de.customerKey,
+        objectId: de.objectId,
+        name: de.name
+      }));
+
+      dependencyReport = await analyzeDependencies(desForAnalysis, {
+        logger,
+        onProgress: (stage, current, total, message) => {
+          spinner.text = message;
+        }
       });
 
+      // Merge dependency info into DE objects
       for (const de of filteredDes) {
-        const depInfo = dependencyResults.get(de.customerKey);
-        if (depInfo) {
-          de.hasDependencies = depInfo.hasDependencies;
-          de.dependencyCount = depInfo.totalCount;
-          de.dependencies = depInfo.all;
-        }
+        const deDeps = dependencyReport.deMapping?.get(de.customerKey) || [];
+        de.hasDependencies = deDeps.length > 0;
+        de.dependencyCount = deDeps.length;
+        de.dependencies = deDeps.map(ref => {
+          const fullDep = dependencyReport.all.find(d => d.type === ref.type && d.id === ref.id);
+          return fullDep || ref;
+        });
+
+        // Count safe vs blocking
+        de.safeToDeleteDeps = de.dependencies.filter(d =>
+          d.classification === DependencyClassification.SAFE_TO_DELETE
+        ).length;
+        de.blockingDeps = de.dependencies.filter(d =>
+          d.classification !== DependencyClassification.SAFE_TO_DELETE
+        ).length;
       }
 
-      spinner.succeed('Dependency check complete');
+      spinner.succeed(`Smart analysis complete: ${dependencyReport.summary.safeToDelete} safe, ${dependencyReport.summary.requiresReview} require review`);
+
+      // Print the smart analysis report
+      console.log(formatAnalysisReport(dependencyReport));
 
       const withDeps = filteredDes.filter(de => de.hasDependencies);
       const withoutDeps = filteredDes.filter(de => !de.hasDependencies);
 
+      // Separate DEs by whether they have only safe deps or blocking deps
+      const withOnlySafeDeps = withDeps.filter(de => de.blockingDeps === 0);
+      const withBlockingDeps = withDeps.filter(de => de.blockingDeps > 0);
+
       if (withDeps.length > 0) {
         console.log('');
-        console.log(chalk.yellow.bold(`⚠️  ${withDeps.length} DATA EXTENSION(S) HAVE DEPENDENCIES:`));
+        console.log(chalk.bold('📊 DEPENDENCY SUMMARY BY DE:'));
         console.log('');
 
-        // Display in a formatted table-like view
-        withDeps.forEach(de => {
-          // DE header with box
-          console.log(chalk.yellow('  ┌─ ') + chalk.yellow.bold(de.name) + chalk.yellow(' ─'.padEnd(50 - de.name.length, '─') + '┐'));
-
-          // Group dependencies by type for cleaner display
-          const depsByType = {};
-          for (const dep of de.dependencies) {
-            if (!depsByType[dep.type]) {
-              depsByType[dep.type] = [];
-            }
-            depsByType[dep.type].push(dep);
+        // Show DEs with only safe dependencies
+        if (withOnlySafeDeps.length > 0) {
+          console.log(chalk.green.bold(`  ✓ ${withOnlySafeDeps.length} DE(s) have ONLY safe-to-delete dependencies`));
+          withOnlySafeDeps.slice(0, 5).forEach(de => {
+            console.log(chalk.green(`    • ${de.name} (${de.safeToDeleteDeps} safe deps)`));
+          });
+          if (withOnlySafeDeps.length > 5) {
+            console.log(chalk.green(`    ... and ${withOnlySafeDeps.length - 5} more`));
           }
-
-          // Display each type
-          for (const [type, deps] of Object.entries(depsByType)) {
-            const typeColor = type === 'Filter Activity' ? chalk.cyan : chalk.red;
-            console.log(chalk.yellow('  │ ') + typeColor.bold(`${type} (${deps.length}):`));
-            deps.slice(0, 3).forEach(dep => {
-              const name = dep.name.length > 45 ? dep.name.substring(0, 42) + '...' : dep.name;
-              console.log(chalk.yellow('  │   ') + chalk.gray(`• ${name}`));
-            });
-            if (deps.length > 3) {
-              console.log(chalk.yellow('  │   ') + chalk.gray.italic(`  ... and ${deps.length - 3} more`));
-            }
-          }
-
-          console.log(chalk.yellow('  └' + '─'.repeat(52) + '┘'));
           console.log('');
-        });
+        }
+
+        // Show DEs with blocking dependencies
+        if (withBlockingDeps.length > 0) {
+          console.log(chalk.yellow.bold(`  ⚠ ${withBlockingDeps.length} DE(s) have BLOCKING dependencies (require review)`));
+          withBlockingDeps.slice(0, 5).forEach(de => {
+            console.log(chalk.yellow(`    • ${de.name} (${de.blockingDeps} blocking, ${de.safeToDeleteDeps} safe)`));
+            // Show blocking deps
+            de.dependencies
+              .filter(d => d.classification !== DependencyClassification.SAFE_TO_DELETE)
+              .slice(0, 2)
+              .forEach(d => {
+                console.log(chalk.gray(`      └─ ${d.type}: ${d.name}`));
+              });
+          });
+          if (withBlockingDeps.length > 5) {
+            console.log(chalk.yellow(`    ... and ${withBlockingDeps.length - 5} more`));
+          }
+          console.log('');
+        }
 
         if (argv.forceDeleteWithDependencies) {
           // Force mode - proceed with all
           console.log(chalk.red.bold('\n⚠️  --force-delete-with-dependencies enabled. Proceeding despite dependencies!'));
+        } else if (argv.deleteSafeDependencies) {
+          // Auto-delete safe dependencies mode
+          console.log(chalk.cyan.bold('\n🔄 --delete-safe-dependencies enabled'));
+          console.log(chalk.cyan('   Safe dependencies will be automatically deleted.'));
+
+          // Collect safe dependencies to delete
+          dependenciesToDelete = dependencyReport.safeToDelete;
+          console.log(chalk.cyan(`   ${dependenciesToDelete.length} safe dependencies queued for deletion.`));
+
+          // Handle blocking deps
+          if (withBlockingDeps.length > 0) {
+            console.log(chalk.yellow(`\n   ${withBlockingDeps.length} DE(s) have blocking dependencies and will be skipped.`));
+            filteredDes = [...withoutDeps, ...withOnlySafeDeps];
+          } else {
+            filteredDes = [...withoutDeps, ...withOnlySafeDeps];
+          }
+
+          // Extract filter activities for deletion (backward compat)
+          filtersToDelete = dependenciesToDelete
+            .filter(d => d.type === 'Filter Activity')
+            .map(d => ({ filterActivityId: d.id, name: d.name }));
         } else {
           // Interactive handling
           console.log('');
           console.log(chalk.cyan('━'.repeat(70)));
           console.log(chalk.cyan.bold('  DEPENDENCY RESOLUTION'));
           console.log(chalk.cyan('━'.repeat(70)));
-          console.log(chalk.gray('  Filter Activities that are NOT part of an automation can be'));
-          console.log(chalk.gray('  automatically deleted along with their Data Extensions.'));
+          console.log(chalk.gray('  Dependencies classified as "safe" (standalone filters, stale automations)'));
+          console.log(chalk.gray('  can be automatically deleted with --delete-safe-dependencies flag.'));
           console.log(chalk.gray('  Other dependencies require manual resolution.'));
 
           const depResult = await handleDependenciesInteractively(
@@ -1029,6 +1088,19 @@ async function runDeletion() {
             process.exit(0);
           }
         }
+      }
+
+      // Export dependency report to CSV
+      if (dependencyReport && dependencyReport.all.length > 0) {
+        const timestamp = dayjs().format('YYYYMMDD-HHmmss');
+        const depCsvPath = path.join(config.paths.audit, `delete-dependencies-${timestamp}.csv`);
+
+        if (!fs.existsSync(config.paths.audit)) {
+          fs.mkdirSync(config.paths.audit, { recursive: true });
+        }
+
+        fs.writeFileSync(depCsvPath, exportReportToCsv(dependencyReport));
+        console.log(chalk.gray(`\n📄 Dependency report saved: ${depCsvPath}`));
       }
     }
 
