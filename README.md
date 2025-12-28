@@ -97,7 +97,7 @@ The toolkit automatically protects system items from accidental deletion:
 - Contact Builder, MobileConnect, CloudPages, Synchronized
 
 **Protected DE Prefixes:**
-- SYS_, CASL_, CAD_, IDP_
+- SYS_, CASL_
 - _Subscribers, _Bounce, _Click, _Job, _Journey, _Open, _Sent
 - ent., ContactMaster
 
