@@ -44,6 +44,7 @@ import {
 import {
   sendWebhook,
   deleteFilterActivity,
+  deleteAutomation,
   checkFilterInAutomations,
   getAutomations,
   getAutomationWithMetadata
@@ -183,7 +184,7 @@ async function sleep(ms) {
 /**
  * Print deletion preview
  */
-function printPreview(dataExtensions, summary, backupDir, filtersToDelete = []) {
+function printPreview(dataExtensions, summary, backupDir, filtersToDelete = [], automationsToDelete = []) {
   const width = 70;
   const line = '─'.repeat(width);
 
@@ -199,6 +200,10 @@ function printPreview(dataExtensions, summary, backupDir, filtersToDelete = []) 
 
   if (filtersToDelete.length > 0) {
     console.log(chalk.yellow(`│`) + ` Filter Activities to Delete: ${filtersToDelete.length}`.padEnd(width) + chalk.yellow(`│`));
+  }
+
+  if (automationsToDelete.length > 0) {
+    console.log(chalk.yellow(`│`) + ` Stale Automations to Delete: ${automationsToDelete.length}`.padEnd(width) + chalk.yellow(`│`));
   }
 
   if (backupDir) {
@@ -228,6 +233,19 @@ function printPreview(dataExtensions, summary, backupDir, filtersToDelete = []) 
     });
     if (filtersToDelete.length > 10) {
       console.log(chalk.yellow(`│`) + `   ... and ${filtersToDelete.length - 10} more`.padEnd(width) + chalk.yellow(`│`));
+    }
+  }
+
+  // Show automations if any
+  if (automationsToDelete.length > 0) {
+    console.log(chalk.yellow(`├${line}┤`));
+    console.log(chalk.yellow(`│`) + ' Stale Automations:'.padEnd(width) + chalk.yellow(`│`));
+    automationsToDelete.slice(0, 10).forEach((auto, i) => {
+      const lineText = `   ${i + 1}. ${auto.name} (${auto.reason})`;
+      console.log(chalk.yellow(`│`) + lineText.substring(0, width).padEnd(width) + chalk.yellow(`│`));
+    });
+    if (automationsToDelete.length > 10) {
+      console.log(chalk.yellow(`│`) + `   ... and ${automationsToDelete.length - 10} more`.padEnd(width) + chalk.yellow(`│`));
     }
   }
 
@@ -705,6 +723,15 @@ function printReport(results, auditPath, backupDir, undoPath) {
     }
   }
 
+  // Show automation results if any were processed
+  if (results.automationsDeleted > 0 || results.automationsFailed > 0) {
+    console.log(chalk.cyan(`│`) + ''.padEnd(width) + chalk.cyan(`│`));
+    console.log(chalk.cyan(`│`) + ` Stale Automations Deleted: ${chalk.green(results.automationsDeleted)}`.padEnd(width + 10) + chalk.cyan(`│`));
+    if (results.automationsFailed > 0) {
+      console.log(chalk.cyan(`│`) + ` Stale Automations Failed: ${chalk.yellow(results.automationsFailed)}`.padEnd(width + 10) + chalk.cyan(`│`));
+    }
+  }
+
   if (results.failedItems && results.failedItems.length > 0) {
     console.log(chalk.cyan(`│`) + ''.padEnd(width) + chalk.cyan(`│`));
     console.log(chalk.cyan(`│`) + ' Failed Deletions:'.padEnd(width) + chalk.cyan(`│`));
@@ -935,6 +962,7 @@ async function runDeletion() {
 
     // Check dependencies using smart analysis
     let filtersToDelete = [];
+    let automationsToDelete = [];
     let dependenciesToDelete = []; // Safe dependencies that will be auto-deleted
     let dependencyReport = null;
 
@@ -1042,10 +1070,15 @@ async function runDeletion() {
             filteredDes = [...withoutDeps, ...withOnlySafeDeps];
           }
 
-          // Extract filter activities for deletion (backward compat)
+          // Extract filter activities for deletion
           filtersToDelete = dependenciesToDelete
             .filter(d => d.type === 'Filter Activity')
-            .map(d => ({ filterActivityId: d.id, name: d.name }));
+            .map(d => ({ id: d.id, name: d.name }));
+
+          // Extract stale automations for deletion
+          automationsToDelete = dependenciesToDelete
+            .filter(d => d.type === 'Automation')
+            .map(d => ({ id: d.id, name: d.name, reason: d.classificationReason }));
         } else {
           // Interactive handling
           console.log('');
@@ -1153,7 +1186,7 @@ async function runDeletion() {
     });
 
     // Show preview
-    printPreview(desToDelete, summary, backupDir, filtersToDelete);
+    printPreview(desToDelete, summary, backupDir, filtersToDelete, automationsToDelete);
 
     // Dry run check
     if (argv.dryRun) {
@@ -1193,7 +1226,9 @@ async function runDeletion() {
       skipped: 0,
       failedItems: [],
       filtersDeleted: 0,
-      filtersFailed: 0
+      filtersFailed: 0,
+      automationsDeleted: 0,
+      automationsFailed: 0
     };
 
     // Delete filter activities first (before their DEs)
@@ -1224,6 +1259,42 @@ async function runDeletion() {
           console.log(chalk.yellow(`    ⚠ Filter deletion error: ${error.message}`));
           results.filtersFailed++;
           logger.warn(`Filter deletion error for ${filter.name}: ${error.message}`);
+        }
+
+        await sleep(config.safety.apiRateLimitDelayMs);
+      }
+
+      console.log('');
+    }
+
+    // Delete stale automations (before their DEs)
+    if (automationsToDelete.length > 0) {
+      console.log(chalk.cyan(`Deleting ${automationsToDelete.length} stale automation(s)...`));
+
+      for (const auto of automationsToDelete) {
+        console.log(chalk.gray(`  Deleting automation: ${auto.name} (${auto.reason})...`));
+
+        try {
+          const autoResult = await deleteAutomation(auto.id, logger);
+
+          if (autoResult.success) {
+            console.log(chalk.green(`    ✓ Automation deleted`));
+            results.automationsDeleted++;
+            auditLogger.addSuccess({
+              type: 'Automation',
+              id: auto.id,
+              name: auto.name,
+              reason: auto.reason
+            });
+          } else {
+            console.log(chalk.yellow(`    ⚠ Automation deletion failed: ${autoResult.error}`));
+            results.automationsFailed++;
+            logger.warn(`Automation deletion failed for ${auto.name}: ${autoResult.error}`);
+          }
+        } catch (error) {
+          console.log(chalk.yellow(`    ⚠ Automation deletion error: ${error.message}`));
+          results.automationsFailed++;
+          logger.warn(`Automation deletion error for ${auto.name}: ${error.message}`);
         }
 
         await sleep(config.safety.apiRateLimitDelayMs);
