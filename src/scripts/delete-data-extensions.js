@@ -555,6 +555,7 @@ async function handleDependenciesInteractively(desWithDeps, logger, autoDeleteFi
   const skip = [];
   const filtersToDelete = [];
   let csvExported = false;
+  let confirmAllMode = null; // null = ask each, 'delete' = delete all, 'skip' = skip all
 
   // Offer CSV export option first (before processing individual DEs)
   if (!nonInteractive && desWithDeps.length > 0) {
@@ -580,6 +581,28 @@ async function handleDependenciesInteractively(desWithDeps, logger, autoDeleteFi
         return { proceed: [], skip: [], filtersToDelete: [], aborted: true, csvExported: true, csvPath };
       }
     }
+
+    // Ask if user wants to confirm all at once or individually
+    const bulkAnswer = await inquirer.prompt([{
+      type: 'list',
+      name: 'bulkMode',
+      message: 'How would you like to handle these DEs with dependencies?',
+      choices: [
+        { name: 'Review and confirm each DE individually', value: 'individual' },
+        { name: 'Delete ALL DEs (and their safe dependencies) without individual prompts', value: 'delete_all' },
+        { name: 'Skip ALL DEs with dependencies', value: 'skip_all' },
+        { name: 'Abort operation', value: 'abort' }
+      ]
+    }]);
+
+    if (bulkAnswer.bulkMode === 'abort') {
+      return { proceed: [], skip: [], filtersToDelete: [], aborted: true };
+    } else if (bulkAnswer.bulkMode === 'delete_all') {
+      confirmAllMode = 'delete';
+    } else if (bulkAnswer.bulkMode === 'skip_all') {
+      confirmAllMode = 'skip';
+    }
+    // 'individual' keeps confirmAllMode as null
   }
 
   // Pre-load automations for efficiency
@@ -641,7 +664,25 @@ async function handleDependenciesInteractively(desWithDeps, logger, autoDeleteFi
     console.log(chalk.yellow('│'));
     console.log(chalk.yellow('└' + '─'.repeat(56) + '┘'));
 
-    // Determine action
+    // Determine action based on confirmAllMode or individual prompts
+    if (confirmAllMode === 'skip') {
+      // Bulk skip mode
+      console.log(chalk.yellow(`  → Skipping (bulk skip mode)`));
+      skip.push(de);
+      continue;
+    } else if (confirmAllMode === 'delete') {
+      // Bulk delete mode - delete DE and safe dependencies, ignore blocking
+      if (blockingDeps.length > 0) {
+        console.log(chalk.cyan(`  → Will delete DE and ${deletableFilters.length} safe dep(s), ignoring ${blockingDeps.length} blocking dep(s)`));
+      } else {
+        console.log(chalk.green(`  → Will delete DE and ${deletableFilters.length} standalone filter(s)`));
+      }
+      proceed.push(de);
+      filtersToDelete.push(...deletableFilters);
+      continue;
+    }
+
+    // Individual confirmation mode (confirmAllMode === null)
     if (blockingDeps.length > 0) {
       // Has blocking dependencies - need user decision
       if (nonInteractive) {
@@ -1383,14 +1424,25 @@ async function runDeletion() {
               name: query.name
             });
           } else {
-            console.log(chalk.yellow(`    ⚠ Query deletion failed: ${queryResult.results?.[0]?.statusMessage || 'Unknown error'}`));
+            const errorMsg = queryResult.results?.[0]?.statusMessage || 'Unknown error';
+            console.log(chalk.yellow(`    ⚠ Query deletion failed: ${errorMsg}`));
             results.queriesFailed++;
-            logger.warn(`Query deletion failed for ${query.name}: ${queryResult.results?.[0]?.statusMessage}`);
+            logger.warn(`Query deletion failed for ${query.name}: ${errorMsg}`);
+            auditLogger.addFailure({
+              type: 'QueryActivity',
+              id: query.id,
+              name: query.name
+            }, errorMsg);
           }
         } catch (error) {
           console.log(chalk.yellow(`    ⚠ Query deletion error: ${error.message}`));
           results.queriesFailed++;
           logger.warn(`Query deletion error for ${query.name}: ${error.message}`);
+          auditLogger.addFailure({
+            type: 'QueryActivity',
+            id: query.id,
+            name: query.name
+          }, error.message);
         }
 
         await sleep(config.safety.apiRateLimitDelayMs);
