@@ -49,6 +49,7 @@ import {
   getAutomations,
   getAutomationWithMetadata
 } from '../lib/sfmc-rest.js';
+import { deleteQueryActivity } from '../lib/sfmc-soap.js';
 
 // Parse command line arguments
 const argv = yargs(hideBin(process.argv))
@@ -86,6 +87,11 @@ const argv = yargs(hideBin(process.argv))
   })
   .option('delete-safe-dependencies', {
     describe: 'Auto-delete dependencies classified as safe (standalone filters, stale automations)',
+    type: 'boolean',
+    default: false
+  })
+  .option('delete-query-dependencies', {
+    describe: 'Also delete Query Activities that reference target DEs (use with --delete-safe-dependencies)',
     type: 'boolean',
     default: false
   })
@@ -184,7 +190,7 @@ async function sleep(ms) {
 /**
  * Print deletion preview
  */
-function printPreview(dataExtensions, summary, backupDir, filtersToDelete = [], automationsToDelete = []) {
+function printPreview(dataExtensions, summary, backupDir, filtersToDelete = [], automationsToDelete = [], queriesToDelete = []) {
   const width = 70;
   const line = '─'.repeat(width);
 
@@ -204,6 +210,10 @@ function printPreview(dataExtensions, summary, backupDir, filtersToDelete = [], 
 
   if (automationsToDelete.length > 0) {
     console.log(chalk.yellow(`│`) + ` Stale Automations to Delete: ${automationsToDelete.length}`.padEnd(width) + chalk.yellow(`│`));
+  }
+
+  if (queriesToDelete.length > 0) {
+    console.log(chalk.yellow(`│`) + ` Query Activities to Delete: ${queriesToDelete.length}`.padEnd(width) + chalk.yellow(`│`));
   }
 
   if (backupDir) {
@@ -246,6 +256,19 @@ function printPreview(dataExtensions, summary, backupDir, filtersToDelete = [], 
     });
     if (automationsToDelete.length > 10) {
       console.log(chalk.yellow(`│`) + `   ... and ${automationsToDelete.length - 10} more`.padEnd(width) + chalk.yellow(`│`));
+    }
+  }
+
+  // Show queries if any
+  if (queriesToDelete.length > 0) {
+    console.log(chalk.yellow(`├${line}┤`));
+    console.log(chalk.yellow(`│`) + ' Query Activities:'.padEnd(width) + chalk.yellow(`│`));
+    queriesToDelete.slice(0, 10).forEach((query, i) => {
+      const lineText = `   ${i + 1}. ${query.name}`;
+      console.log(chalk.yellow(`│`) + lineText.substring(0, width).padEnd(width) + chalk.yellow(`│`));
+    });
+    if (queriesToDelete.length > 10) {
+      console.log(chalk.yellow(`│`) + `   ... and ${queriesToDelete.length - 10} more`.padEnd(width) + chalk.yellow(`│`));
     }
   }
 
@@ -732,6 +755,15 @@ function printReport(results, auditPath, backupDir, undoPath) {
     }
   }
 
+  // Show query results if any were processed
+  if (results.queriesDeleted > 0 || results.queriesFailed > 0) {
+    console.log(chalk.cyan(`│`) + ''.padEnd(width) + chalk.cyan(`│`));
+    console.log(chalk.cyan(`│`) + ` Query Activities Deleted: ${chalk.green(results.queriesDeleted)}`.padEnd(width + 10) + chalk.cyan(`│`));
+    if (results.queriesFailed > 0) {
+      console.log(chalk.cyan(`│`) + ` Query Activities Failed: ${chalk.yellow(results.queriesFailed)}`.padEnd(width + 10) + chalk.cyan(`│`));
+    }
+  }
+
   if (results.failedItems && results.failedItems.length > 0) {
     console.log(chalk.cyan(`│`) + ''.padEnd(width) + chalk.cyan(`│`));
     console.log(chalk.cyan(`│`) + ' Failed Deletions:'.padEnd(width) + chalk.cyan(`│`));
@@ -963,6 +995,7 @@ async function runDeletion() {
     // Check dependencies using smart analysis
     let filtersToDelete = [];
     let automationsToDelete = [];
+    let queriesToDelete = [];
     let dependenciesToDelete = []; // Safe dependencies that will be auto-deleted
     let dependencyReport = null;
 
@@ -1079,6 +1112,32 @@ async function runDeletion() {
           automationsToDelete = dependenciesToDelete
             .filter(d => d.type === 'Automation')
             .map(d => ({ id: d.id, name: d.name, reason: d.classificationReason }));
+
+          // Extract query activities for deletion (if --delete-query-dependencies is set)
+          if (argv.deleteQueryDependencies) {
+            // Get ALL query activities that reference target DEs (regardless of classification)
+            queriesToDelete = dependencyReport.all
+              .filter(d => d.type === 'Query Activity')
+              .map(d => ({ id: d.id, name: d.name, matchDetails: d.metadata?.matchDetails }));
+
+            if (queriesToDelete.length > 0) {
+              console.log(chalk.cyan(`   ${queriesToDelete.length} Query Activities queued for deletion.`));
+
+              // With queries being deleted, DEs that were blocked only by queries can now proceed
+              const desBlockedOnlyByQueries = withBlockingDeps.filter(de => {
+                const nonQueryBlockingDeps = de.dependencies.filter(d =>
+                  d.classification !== DependencyClassification.SAFE_TO_DELETE &&
+                  d.type !== 'Query Activity'
+                );
+                return nonQueryBlockingDeps.length === 0;
+              });
+
+              if (desBlockedOnlyByQueries.length > 0) {
+                console.log(chalk.cyan(`   ${desBlockedOnlyByQueries.length} DE(s) unblocked (were only blocked by queries).`));
+                filteredDes = [...withoutDeps, ...withOnlySafeDeps, ...desBlockedOnlyByQueries];
+              }
+            }
+          }
         } else {
           // Interactive handling
           console.log('');
@@ -1186,7 +1245,7 @@ async function runDeletion() {
     });
 
     // Show preview
-    printPreview(desToDelete, summary, backupDir, filtersToDelete, automationsToDelete);
+    printPreview(desToDelete, summary, backupDir, filtersToDelete, automationsToDelete, queriesToDelete);
 
     // Dry run check
     if (argv.dryRun) {
@@ -1228,7 +1287,9 @@ async function runDeletion() {
       filtersDeleted: 0,
       filtersFailed: 0,
       automationsDeleted: 0,
-      automationsFailed: 0
+      automationsFailed: 0,
+      queriesDeleted: 0,
+      queriesFailed: 0
     };
 
     // Delete filter activities first (before their DEs)
@@ -1295,6 +1356,41 @@ async function runDeletion() {
           console.log(chalk.yellow(`    ⚠ Automation deletion error: ${error.message}`));
           results.automationsFailed++;
           logger.warn(`Automation deletion error for ${auto.name}: ${error.message}`);
+        }
+
+        await sleep(config.safety.apiRateLimitDelayMs);
+      }
+
+      console.log('');
+    }
+
+    // Delete query activities (before their DEs)
+    if (queriesToDelete.length > 0) {
+      console.log(chalk.cyan(`Deleting ${queriesToDelete.length} query activity(s)...`));
+
+      for (const query of queriesToDelete) {
+        console.log(chalk.gray(`  Deleting query: ${query.name}...`));
+
+        try {
+          const queryResult = await deleteQueryActivity(query.id, logger);
+
+          if (queryResult.success) {
+            console.log(chalk.green(`    ✓ Query deleted`));
+            results.queriesDeleted++;
+            auditLogger.addSuccess({
+              type: 'QueryActivity',
+              id: query.id,
+              name: query.name
+            });
+          } else {
+            console.log(chalk.yellow(`    ⚠ Query deletion failed: ${queryResult.results?.[0]?.statusMessage || 'Unknown error'}`));
+            results.queriesFailed++;
+            logger.warn(`Query deletion failed for ${query.name}: ${queryResult.results?.[0]?.statusMessage}`);
+          }
+        } catch (error) {
+          console.log(chalk.yellow(`    ⚠ Query deletion error: ${error.message}`));
+          results.queriesFailed++;
+          logger.warn(`Query deletion error for ${query.name}: ${error.message}`);
         }
 
         await sleep(config.safety.apiRateLimitDelayMs);

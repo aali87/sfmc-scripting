@@ -548,6 +548,16 @@ export async function deleteFolder(folderId, logger = null) {
 // Export filter builders
 export { buildSimpleFilter, buildComplexFilter, escapeXml };
 
+/**
+ * Delete a Query Activity (QueryDefinition) by ObjectID
+ * @param {string} objectId - The ObjectID of the query to delete
+ * @param {object} logger - Logger instance
+ * @returns {Promise<object>} Delete result
+ */
+export async function deleteQueryActivity(objectId, logger = null) {
+  return deleteObjects('QueryDefinition', [{ ObjectID: objectId }], logger);
+}
+
 export default {
   retrieve,
   deleteObjects,
@@ -560,6 +570,7 @@ export default {
   retrieveImportDefinitions,
   deleteDataExtension,
   deleteFolder,
+  deleteQueryActivity,
   buildSimpleFilter,
   buildComplexFilter
 };
