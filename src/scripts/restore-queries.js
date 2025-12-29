@@ -112,6 +112,44 @@ function loadCachedQueries() {
 }
 
 /**
+ * Build a map of query activity name -> target DE from automation steps
+ * This extracts target DE info that isn't available in the QueryDefinition SOAP response
+ */
+function buildQueryTargetDEMap() {
+  const cachePath = path.join(config.paths.root, 'cache', `bulk-data-${config.sfmc.accountId}.json`);
+
+  if (!fs.existsSync(cachePath)) {
+    return new Map();
+  }
+
+  const data = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+  const automations = data.data?.automations || [];
+  const queryToTargetDE = new Map();
+
+  for (const auto of automations) {
+    if (auto.steps) {
+      for (const step of auto.steps) {
+        if (step.activities) {
+          for (const activity of step.activities) {
+            // objectTypeId 300 = Query Activity
+            if (activity.objectTypeId === 300 && activity.targetDataExtensions && activity.targetDataExtensions.length > 0) {
+              const targetDE = activity.targetDataExtensions[0];
+              queryToTargetDE.set(activity.name, {
+                targetDEName: targetDE.name,
+                targetDEKey: targetDE.key,
+                activityObjectId: activity.activityObjectId
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return queryToTargetDE;
+}
+
+/**
  * Print restoration preview
  */
 function printPreview(queries, summary) {
@@ -126,6 +164,9 @@ function printPreview(queries, summary) {
   console.log(chalk.cyan(`│`) + ` Queries to Restore: ${queries.length}`.padEnd(width) + chalk.cyan(`│`));
   console.log(chalk.cyan(`│`) + ` With SQL Text: ${summary.withSql}`.padEnd(width) + chalk.cyan(`│`));
   console.log(chalk.cyan(`│`) + ` With Target DE: ${summary.withTarget}`.padEnd(width) + chalk.cyan(`│`));
+  if (summary.skippedNoTarget > 0) {
+    console.log(chalk.cyan(`│`) + chalk.yellow(` Skipped (no target DE): ${summary.skippedNoTarget}`).padEnd(width + 10) + chalk.cyan(`│`));
+  }
   console.log(chalk.cyan(`├${line}┤`));
   console.log(chalk.cyan(`│`) + ' Sample Queries:'.padEnd(width) + chalk.cyan(`│`));
 
@@ -256,6 +297,7 @@ async function runRestoration() {
     const spinner = ora('Loading recovery data...').start();
 
     let queriesToRestore = [];
+    let queryTargetDEMap = new Map();
 
     // Try to load from recovery file first
     if (fs.existsSync(argv.input)) {
@@ -269,15 +311,26 @@ async function runRestoration() {
         if (q.Name) cachedByName.set(q.Name, q);
       });
 
-      // Match recovery queries to cached data
+      // Build target DE map from automation steps
+      spinner.text = 'Extracting target DEs from automation steps...';
+      queryTargetDEMap = buildQueryTargetDEMap();
+
+      // Match recovery queries to cached data and enrich with target DE
       for (const rq of recoveryData.queries || []) {
         const cached = cachedByName.get(rq.name);
         if (cached && cached.QueryText) {
+          // Enrich with target DE from automation steps
+          const targetInfo = queryTargetDEMap.get(cached.Name);
+          if (targetInfo) {
+            cached._targetDEKey = targetInfo.targetDEKey;
+            cached._targetDEName = targetInfo.targetDEName;
+          }
           queriesToRestore.push(cached);
         }
       }
 
-      spinner.succeed(`Loaded ${queriesToRestore.length} queries from recovery file`);
+      const withTargetDE = queriesToRestore.filter(q => q._targetDEKey).length;
+      spinner.succeed(`Loaded ${queriesToRestore.length} queries (${withTargetDE} with target DE from automations)`);
     } else {
       spinner.fail(`Recovery file not found: ${argv.input}`);
       console.log(chalk.yellow('\nRun the deletion audit first to generate the recovery file.'));
@@ -286,6 +339,25 @@ async function runRestoration() {
 
     if (queriesToRestore.length === 0) {
       console.log(chalk.yellow('No queries found to restore.'));
+      process.exit(0);
+    }
+
+    // Filter to only queries with target DE (required for creation)
+    const queriesWithTarget = queriesToRestore.filter(q => q._targetDEKey);
+    const queriesWithoutTarget = queriesToRestore.filter(q => !q._targetDEKey);
+
+    if (queriesWithoutTarget.length > 0) {
+      console.log(chalk.yellow(`\n⚠ ${queriesWithoutTarget.length} queries have no target DE and will be skipped.`));
+      console.log(chalk.gray('  (Target DE is required to create a Query Activity)'));
+    }
+
+    // Only restore queries that have a target DE
+    queriesToRestore = queriesWithTarget;
+
+    if (queriesToRestore.length === 0) {
+      console.log(chalk.yellow('\nNo queries with target DE found to restore.'));
+      console.log(chalk.gray('Target DE info is extracted from automation steps.'));
+      console.log(chalk.gray('Queries not used in automations cannot be auto-restored.'));
       process.exit(0);
     }
 
@@ -305,7 +377,8 @@ async function runRestoration() {
     // Calculate summary
     const summary = {
       withSql: queriesToRestore.filter(q => q.QueryText).length,
-      withTarget: queriesToRestore.filter(q => q.DataExtensionTarget?.CustomerKey).length
+      withTarget: queriesToRestore.filter(q => q._targetDEKey).length,
+      skippedNoTarget: queriesWithoutTarget.length
     };
 
     // Show preview
@@ -362,21 +435,24 @@ async function runRestoration() {
           CategoryID: query.CategoryID
         };
 
-        // Add target DE if available
-        if (query.DataExtensionTarget?.CustomerKey) {
+        // Add target DE from automation steps (enriched earlier)
+        if (query._targetDEKey) {
+          queryData.DataExtensionTargetKey = query._targetDEKey;
+        } else if (query.DataExtensionTarget?.CustomerKey) {
           queryData.DataExtensionTargetKey = query.DataExtensionTarget.CustomerKey;
         }
 
         const result = await createQueryActivity(queryData, logger);
 
         if (result.success) {
-          spinner.succeed(`${progress} Created: ${query.Name}`);
+          spinner.succeed(`${progress} Created: ${query.Name} -> ${query._targetDEName || 'N/A'}`);
           results.successful++;
           results.successfulItems.push({
             name: query.Name,
             customerKey: queryData.CustomerKey,
             newObjectId: result.objectId,
-            targetDE: query.DataExtensionTarget?.CustomerKey || 'N/A',
+            targetDE: query._targetDEKey || query.DataExtensionTarget?.CustomerKey || 'N/A',
+            targetDEName: query._targetDEName || 'N/A',
             restoredAt: new Date().toISOString()
           });
 
