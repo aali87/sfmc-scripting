@@ -558,6 +558,100 @@ export async function deleteQueryActivity(objectId, logger = null) {
   return deleteObjects('QueryDefinition', [{ ObjectID: objectId }], logger);
 }
 
+/**
+ * Create a Query Activity (QueryDefinition)
+ * @param {object} queryData - Query data
+ * @param {string} queryData.Name - Query name
+ * @param {string} queryData.CustomerKey - Customer key (optional, defaults to Name)
+ * @param {string} queryData.QueryText - SQL query text
+ * @param {string} queryData.TargetType - Target type (DE)
+ * @param {string} queryData.TargetUpdateType - Update type (Overwrite, Update, Append)
+ * @param {string} queryData.CategoryID - Folder category ID
+ * @param {string} queryData.DataExtensionTargetKey - Target DE CustomerKey (optional)
+ * @param {object} logger - Logger instance
+ * @returns {Promise<object>} Create result with success flag and objectId
+ */
+export async function createQueryActivity(queryData, logger = null) {
+  const {
+    Name,
+    CustomerKey = Name,
+    QueryText,
+    TargetType = 'DE',
+    TargetUpdateType = 'Overwrite',
+    CategoryID,
+    DataExtensionTargetKey
+  } = queryData;
+
+  if (!Name || !QueryText) {
+    return { success: false, error: 'Name and QueryText are required' };
+  }
+
+  // Build target DE reference if provided
+  let targetDeXml = '';
+  if (DataExtensionTargetKey) {
+    targetDeXml = `
+      <DataExtensionTarget>
+        <CustomerKey>${escapeXml(DataExtensionTargetKey)}</CustomerKey>
+      </DataExtensionTarget>`;
+  }
+
+  // Build category reference if provided
+  let categoryXml = '';
+  if (CategoryID) {
+    categoryXml = `<CategoryID>${escapeXml(String(CategoryID))}</CategoryID>`;
+  }
+
+  const soapBody = `
+    <CreateRequest xmlns="${NAMESPACES.et}">
+      <Objects xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="QueryDefinition">
+        <Name>${escapeXml(Name)}</Name>
+        <CustomerKey>${escapeXml(CustomerKey)}</CustomerKey>
+        <QueryText>${escapeXml(QueryText)}</QueryText>
+        <TargetType>${escapeXml(TargetType)}</TargetType>
+        <TargetUpdateType>${escapeXml(TargetUpdateType)}</TargetUpdateType>
+        ${categoryXml}
+        ${targetDeXml}
+      </Objects>
+    </CreateRequest>`;
+
+  try {
+    const body = await makeSoapRequest(soapBody, logger, 0, 'Create');
+
+    if (logger) {
+      logger.debug(`Create response body: ${JSON.stringify(body)}`);
+    }
+
+    const response = body.CreateResponse;
+
+    if (!response) {
+      return { success: false, error: 'Invalid SOAP response: missing CreateResponse' };
+    }
+
+    // Parse results
+    const results = Array.isArray(response.Results) ? response.Results : [response.Results];
+    const result = results[0];
+
+    if (result.StatusCode === 'OK') {
+      return {
+        success: true,
+        objectId: result.NewObjectID || result.Object?.ObjectID,
+        statusCode: result.StatusCode
+      };
+    } else {
+      return {
+        success: false,
+        error: result.StatusMessage || `StatusCode: ${result.StatusCode}`,
+        statusCode: result.StatusCode
+      };
+    }
+  } catch (error) {
+    if (logger) {
+      logger.error(`Create QueryDefinition failed: ${error.message}`);
+    }
+    return { success: false, error: error.message };
+  }
+}
+
 export default {
   retrieve,
   deleteObjects,
@@ -571,6 +665,7 @@ export default {
   deleteDataExtension,
   deleteFolder,
   deleteQueryActivity,
+  createQueryActivity,
   buildSimpleFilter,
   buildComplexFilter
 };
