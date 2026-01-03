@@ -257,10 +257,12 @@ export async function retrieve(objectType, properties, filter = null, logger = n
       throw new Error(`Retrieve failed: ${errorMsg}`);
     }
 
-    // Extract results
-    if (response.Results) {
+    // Extract results - validate Results exists and is not null/undefined
+    if (response.Results != null) {
       const results = Array.isArray(response.Results) ? response.Results : [response.Results];
-      allResults.push(...results);
+      // Filter out any null/undefined entries that could occur with malformed responses
+      const validResults = results.filter(r => r != null);
+      allResults.push(...validResults);
     }
 
     // Check for more results

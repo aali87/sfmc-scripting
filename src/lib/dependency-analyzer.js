@@ -540,6 +540,14 @@ function classifyFilter(enriched, bulkData, staleThreshold) {
     modifiedDate: filterData.modifiedDate
   };
 
+  // If no filter ID, can't determine automation usage - mark as unknown
+  if (!filterId) {
+    enriched.classification = DependencyClassification.UNKNOWN;
+    enriched.classificationReason = ClassificationReason.NO_METADATA;
+    enriched.canDelete = false;
+    return;
+  }
+
   // Check if filter is used in any automation
   const automationsUsingFilter = findAutomationsContainingActivity(filterId, bulkData);
 

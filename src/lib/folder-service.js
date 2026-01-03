@@ -373,7 +373,7 @@ export async function deleteFolder(folderId, logger = null) {
 
     if (result.success) {
       // Clear cache after successful deletion
-      clearFolderCache();
+      await clearFolderCache();
     }
 
     return result;

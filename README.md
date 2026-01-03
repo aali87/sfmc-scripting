@@ -252,14 +252,44 @@ node src/scripts/delete-folders.js --folder "Data Extensions/Archive" [options]
 Debug scripts for troubleshooting specific issues:
 
 ```bash
+# Test SOAP connectivity
+node src/scripts/debug-soap.js
+
 # Test dependency detection for a specific DE
 node src/scripts/debug-de-dependencies.js "DE CustomerKey"
 
-# Test SOAP connectivity
-node debug-soap.js
+# Test automation details
+node src/scripts/debug-automation.js "Automation Name"
 
-# Test delete operation format
-node debug-delete.js
+# Test filter activity details
+node src/scripts/debug-filter.js "FilterId"
+
+# Test dependency classification
+node src/scripts/debug-dependency.js "DE_CustomerKey"
+```
+
+## Restore Scripts
+
+Restore previously deleted items from backups:
+
+```bash
+# Restore Data Extensions from backup
+node src/scripts/restore-data-extensions.js --backup-file "backup/de-schemas-20240101.json"
+
+# Restore Query Activities from backup
+node src/scripts/restore-queries.js --backup-file "backup/queries-20240101.json"
+
+# Update automation query references after restore
+node src/scripts/update-automation-queries.js --mapping-file "restore/query-mapping.json"
+```
+
+## Analyze Dependencies
+
+Standalone dependency analysis without deletion:
+
+```bash
+# Analyze dependencies for DEs in a folder
+node src/scripts/analyze-dependencies.js --folder "Data Extensions/Archive"
 ```
 
 ## Caching
