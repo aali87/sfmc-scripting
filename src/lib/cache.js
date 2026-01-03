@@ -11,28 +11,19 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { sleep, CACHE_CONFIG } from './utils.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CACHE_DIR = path.resolve(__dirname, '../../cache');
 
-// Default cache expiry: 24 hours (in milliseconds)
-const DEFAULT_CACHE_EXPIRY_MS = 24 * 60 * 60 * 1000;
-
-// Lock timeout: 30 seconds (if lock file is older than this, consider it stale)
-const LOCK_TIMEOUT_MS = 30 * 1000;
-
-// Lock retry settings
-const LOCK_RETRY_DELAY_MS = 100;
-const LOCK_MAX_RETRIES = 50; // 5 seconds total
-
-/**
- * Sleep helper
- * @param {number} ms - Milliseconds to sleep
- */
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+// Use shared constants from utils
+const {
+  DEFAULT_EXPIRY_MS: DEFAULT_CACHE_EXPIRY_MS,
+  LOCK_TIMEOUT_MS,
+  LOCK_RETRY_DELAY_MS,
+  LOCK_MAX_RETRIES
+} = CACHE_CONFIG;
 
 /**
  * Ensure cache directory exists

@@ -7,6 +7,7 @@ import axios from 'axios';
 import { parseStringPromise, Builder } from 'xml2js';
 import { getAccessToken } from './sfmc-auth.js';
 import config from '../config/index.js';
+import { sleep, isRetryableError, calculateBackoffDelay, RETRY_CONFIG } from './utils.js';
 
 // SOAP namespaces
 const NAMESPACES = {
@@ -16,17 +17,7 @@ const NAMESPACES = {
   et: 'http://exacttarget.com/wsdl/partnerAPI'
 };
 
-// Retry configuration
-const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 1000;
-
-/**
- * Sleep helper for rate limiting and retries
- * @param {number} ms - Milliseconds to sleep
- */
-async function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+const { MAX_RETRIES, RETRY_DELAY_MS } = RETRY_CONFIG;
 
 /**
  * Build SOAP envelope with fueloauth header (OAuth 2.0)
@@ -111,21 +102,13 @@ async function makeSoapRequest(soapBody, logger, retryCount = 0, soapAction = 'R
 
   } catch (error) {
     // Handle retryable errors
-    if (retryCount < MAX_RETRIES) {
-      const isRetryable =
-        error.code === 'ETIMEDOUT' ||
-        error.code === 'ECONNRESET' ||
-        (error.response && error.response.status === 503) ||
-        (error.response && error.response.status === 429);
-
-      if (isRetryable) {
-        const delay = RETRY_DELAY_MS * Math.pow(2, retryCount); // Exponential backoff
-        if (logger) {
-          logger.warn(`Request failed, retrying in ${delay}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`);
-        }
-        await sleep(delay);
-        return makeSoapRequest(soapBody, logger, retryCount + 1, soapAction);
+    if (retryCount < MAX_RETRIES && isRetryableError(error)) {
+      const delay = calculateBackoffDelay(retryCount);
+      if (logger) {
+        logger.warn(`Request failed, retrying in ${delay}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`);
       }
+      await sleep(delay);
+      return makeSoapRequest(soapBody, logger, retryCount + 1, soapAction);
     }
 
     // Handle specific error types
@@ -652,6 +635,166 @@ export async function createQueryActivity(queryData, logger = null) {
   }
 }
 
+/**
+ * Create a Data Extension
+ * @param {object} deData - Data Extension data
+ * @param {string} deData.Name - DE name
+ * @param {string} deData.CustomerKey - Customer key
+ * @param {string} deData.Description - Description (optional)
+ * @param {number} deData.CategoryID - Folder category ID
+ * @param {boolean} deData.IsSendable - Whether DE is sendable
+ * @param {boolean} deData.IsTestable - Whether DE is testable
+ * @param {object} deData.SendableSubscriberField - Sendable subscriber field (optional)
+ * @param {object} deData.SendableDataExtensionField - Sendable DE field (optional)
+ * @param {array} deData.Fields - Array of field definitions
+ * @param {object} logger - Logger instance
+ * @returns {Promise<object>} Create result with success flag and objectId
+ */
+export async function createDataExtension(deData, logger = null) {
+  const {
+    Name,
+    CustomerKey,
+    Description = '',
+    CategoryID,
+    IsSendable = false,
+    IsTestable = false,
+    SendableSubscriberField = null,
+    SendableDataExtensionField = null,
+    Fields = []
+  } = deData;
+
+  if (!Name || !CustomerKey) {
+    return { success: false, error: 'Name and CustomerKey are required' };
+  }
+
+  if (!Fields || Fields.length === 0) {
+    return { success: false, error: 'At least one field is required' };
+  }
+
+  // Determine if we can actually make this sendable
+  // A sendable DE requires both SendableSubscriberField and SendableDataExtensionField
+  const canBeSendable = IsSendable && SendableSubscriberField && SendableDataExtensionField;
+  const actualIsSendable = canBeSendable;
+
+  if (logger && IsSendable && !canBeSendable) {
+    logger.debug(`DE "${Name}" marked as sendable but missing sendable field config - creating as non-sendable`);
+  }
+
+  // Build fields XML - fields should be wrapped in <Fields><Field>...</Field></Fields>
+  const fieldElements = Fields.map((field) => {
+    const parts = [];
+    parts.push('<Field>');
+    parts.push(`<Name>${escapeXml(field.name)}</Name>`);
+    parts.push(`<FieldType>${escapeXml(field.fieldType)}</FieldType>`);
+
+    if (field.isPrimaryKey) {
+      parts.push('<IsPrimaryKey>true</IsPrimaryKey>');
+    }
+    if (field.isRequired) {
+      parts.push('<IsRequired>true</IsRequired>');
+    }
+    if (field.maxLength !== null && field.maxLength !== undefined) {
+      parts.push(`<MaxLength>${field.maxLength}</MaxLength>`);
+    }
+    if (field.scale !== null && field.scale !== undefined && field.scale > 0) {
+      parts.push(`<Scale>${field.scale}</Scale>`);
+    }
+    if (field.defaultValue !== null && field.defaultValue !== undefined) {
+      parts.push(`<DefaultValue>${escapeXml(String(field.defaultValue))}</DefaultValue>`);
+    }
+
+    parts.push('</Field>');
+    return parts.join('');
+  }).join('\n          ');
+
+  const fieldsXml = `<Fields>\n          ${fieldElements}\n        </Fields>`;
+
+  if (logger) {
+    logger.debug(`Building DE with ${Fields.length} fields`);
+  }
+
+  // Build sendable fields if applicable
+  let sendableXml = '';
+  if (actualIsSendable) {
+    const subscriberFieldName = typeof SendableSubscriberField === 'string'
+      ? SendableSubscriberField
+      : (SendableSubscriberField.Name || SendableSubscriberField.name || 'Subscriber Key');
+    const deFieldName = typeof SendableDataExtensionField === 'string'
+      ? SendableDataExtensionField
+      : (SendableDataExtensionField.Name || SendableDataExtensionField.name);
+
+    sendableXml = `
+        <SendableSubscriberField>
+          <Name>${escapeXml(subscriberFieldName)}</Name>
+        </SendableSubscriberField>
+        <SendableDataExtensionField>
+          <Name>${escapeXml(deFieldName)}</Name>
+        </SendableDataExtensionField>`;
+  }
+
+  // Build category reference if provided
+  let categoryXml = '';
+  if (CategoryID) {
+    categoryXml = `<CategoryID>${escapeXml(String(CategoryID))}</CategoryID>`;
+  }
+
+  const soapBody = `
+    <CreateRequest xmlns="${NAMESPACES.et}">
+      <Objects xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="DataExtension">
+        <Name>${escapeXml(Name)}</Name>
+        <CustomerKey>${escapeXml(CustomerKey)}</CustomerKey>
+        <Description>${escapeXml(Description)}</Description>
+        ${categoryXml}
+        <IsSendable>${actualIsSendable}</IsSendable>
+        <IsTestable>${IsTestable}</IsTestable>
+        ${sendableXml}
+        ${fieldsXml}
+      </Objects>
+    </CreateRequest>`;
+
+  if (logger) {
+    // Log first 2000 chars of soap body for debugging
+    logger.debug(`SOAP Body (first 2000 chars): ${soapBody.substring(0, 2000)}`);
+  }
+
+  try {
+    const body = await makeSoapRequest(soapBody, logger, 0, 'Create');
+
+    if (logger) {
+      logger.debug(`Create DE response body: ${JSON.stringify(body)}`);
+    }
+
+    const response = body.CreateResponse;
+
+    if (!response) {
+      return { success: false, error: 'Invalid SOAP response: missing CreateResponse' };
+    }
+
+    // Parse results
+    const results = Array.isArray(response.Results) ? response.Results : [response.Results];
+    const result = results[0];
+
+    if (result.StatusCode === 'OK') {
+      return {
+        success: true,
+        objectId: result.NewObjectID || result.Object?.ObjectID,
+        statusCode: result.StatusCode
+      };
+    } else {
+      return {
+        success: false,
+        error: result.StatusMessage || `StatusCode: ${result.StatusCode}`,
+        statusCode: result.StatusCode
+      };
+    }
+  } catch (error) {
+    if (logger) {
+      logger.error(`Create DataExtension failed: ${error.message}`);
+    }
+    return { success: false, error: error.message };
+  }
+}
+
 export default {
   retrieve,
   deleteObjects,
@@ -666,6 +809,7 @@ export default {
   deleteFolder,
   deleteQueryActivity,
   createQueryActivity,
+  createDataExtension,
   buildSimpleFilter,
   buildComplexFilter
 };

@@ -5,6 +5,7 @@
 
 import axios from 'axios';
 import config from '../config/index.js';
+import { extractErrorMessage } from './utils.js';
 
 // Token cache
 let tokenCache = {
@@ -183,51 +184,6 @@ export async function testConnection(logger = null) {
       error: error.message
     };
   }
-}
-
-/**
- * Extract meaningful error message from axios error
- * @param {Error} error - Axios error object
- * @returns {string} Human-readable error message
- */
-function extractErrorMessage(error) {
-  if (error.response) {
-    // Server responded with error status
-    const data = error.response.data;
-    if (data) {
-      if (typeof data === 'string') {
-        return data;
-      }
-      if (data.error_description) {
-        return data.error_description;
-      }
-      if (data.error) {
-        return `${data.error}: ${data.error_description || 'No details provided'}`;
-      }
-      if (data.message) {
-        return data.message;
-      }
-      return JSON.stringify(data);
-    }
-    return `HTTP ${error.response.status}: ${error.response.statusText}`;
-  }
-
-  if (error.request) {
-    // Request made but no response
-    if (error.code === 'ECONNREFUSED') {
-      return 'Connection refused. Check SFMC URL configuration.';
-    }
-    if (error.code === 'ENOTFOUND') {
-      return 'Host not found. Check SFMC subdomain configuration.';
-    }
-    if (error.code === 'ETIMEDOUT') {
-      return 'Request timed out. Check network connectivity.';
-    }
-    return `Network error: ${error.code || 'No response from server'}`;
-  }
-
-  // Something else went wrong
-  return error.message || 'Unknown error';
 }
 
 export default {

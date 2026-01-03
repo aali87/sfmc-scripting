@@ -12,12 +12,13 @@ import {
 import { isFolderProtected } from '../config/index.js';
 import { readCache, writeCache, clearCache, getCacheInfo } from './cache.js';
 import config from '../config/index.js';
+import { CACHE_CONFIG } from './utils.js';
 
 // Cache type identifier
 const FOLDER_CACHE_TYPE = 'folders';
 
-// Default cache expiry: 24 hours (can be overridden or ignored)
-const DEFAULT_CACHE_EXPIRY_MS = 24 * 60 * 60 * 1000;
+// Use shared cache expiry constant
+const DEFAULT_CACHE_EXPIRY_MS = CACHE_CONFIG.DEFAULT_EXPIRY_MS;
 
 // In-memory cache for current session (faster than file reads)
 let memoryCache = {

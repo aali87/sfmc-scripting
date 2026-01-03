@@ -6,18 +6,15 @@
 import axios from 'axios';
 import { getAccessToken } from './sfmc-auth.js';
 import config from '../config/index.js';
+import {
+  sleep,
+  extractErrorMessage,
+  isRetryableError,
+  calculateBackoffDelay,
+  RETRY_CONFIG
+} from './utils.js';
 
-// Retry configuration
-const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 1000;
-
-/**
- * Sleep helper for rate limiting and retries
- * @param {number} ms - Milliseconds to sleep
- */
-async function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+const { MAX_RETRIES, RETRY_DELAY_MS } = RETRY_CONFIG;
 
 /**
  * Create axios instance with auth headers
@@ -69,76 +66,26 @@ async function makeRequest(method, endpoint, data = null, params = null, logger 
 
   } catch (error) {
     // Handle retryable errors
-    if (retryCount < MAX_RETRIES) {
-      const isRetryable =
-        error.code === 'ETIMEDOUT' ||
-        error.code === 'ECONNRESET' ||
-        (error.response && error.response.status === 503) ||
-        (error.response && error.response.status === 429);
+    if (retryCount < MAX_RETRIES && isRetryableError(error)) {
+      let delay = calculateBackoffDelay(retryCount);
 
-      if (isRetryable) {
-        let delay = RETRY_DELAY_MS * Math.pow(2, retryCount);
-
-        // Check for Retry-After header
-        if (error.response && error.response.headers['retry-after']) {
-          delay = parseInt(error.response.headers['retry-after'], 10) * 1000;
-        }
-
-        if (logger) {
-          logger.warn(`Request failed, retrying in ${delay}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`);
-        }
-
-        await sleep(delay);
-        return makeRequest(method, endpoint, data, params, logger, retryCount + 1);
+      // Check for Retry-After header
+      if (error.response && error.response.headers['retry-after']) {
+        delay = parseInt(error.response.headers['retry-after'], 10) * 1000;
       }
+
+      if (logger) {
+        logger.warn(`Request failed, retrying in ${delay}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`);
+      }
+
+      await sleep(delay);
+      return makeRequest(method, endpoint, data, params, logger, retryCount + 1);
     }
 
     // Extract error message
     const errorMessage = extractErrorMessage(error);
     throw new Error(`REST API error [${method.toUpperCase()} ${endpoint}]: ${errorMessage}`);
   }
-}
-
-/**
- * Extract meaningful error message from axios error
- * @param {Error} error - Axios error object
- * @returns {string} Human-readable error message
- */
-function extractErrorMessage(error) {
-  if (error.response) {
-    const data = error.response.data;
-    if (data) {
-      if (typeof data === 'string') {
-        return data;
-      }
-      if (data.message) {
-        return data.message;
-      }
-      if (data.error) {
-        return typeof data.error === 'string' ? data.error : JSON.stringify(data.error);
-      }
-      if (data.errors && Array.isArray(data.errors)) {
-        return data.errors.map(e => e.message || e).join('; ');
-      }
-      return JSON.stringify(data);
-    }
-    return `HTTP ${error.response.status}: ${error.response.statusText}`;
-  }
-
-  if (error.request) {
-    if (error.code === 'ECONNREFUSED') {
-      return 'Connection refused. Check SFMC URL configuration.';
-    }
-    if (error.code === 'ENOTFOUND') {
-      return 'Host not found. Check SFMC subdomain configuration.';
-    }
-    if (error.code === 'ETIMEDOUT') {
-      return 'Request timed out.';
-    }
-    return `Network error: ${error.code || 'No response'}`;
-  }
-
-  return error.message || 'Unknown error';
 }
 
 /**
