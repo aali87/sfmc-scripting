@@ -24,7 +24,7 @@ import dayjs from 'dayjs';
 import config, { validateConfig } from '../config/index.js';
 import { createLogger, createAuditLogger } from '../lib/logger.js';
 import { testConnection } from '../lib/sfmc-auth.js';
-import { createQueryActivity } from '../lib/sfmc-soap.js';
+import { createQueryActivity, retrieveDataExtensions, escapeXml } from '../lib/sfmc-soap.js';
 
 // Parse command line arguments
 const argv = yargs(hideBin(process.argv))
@@ -147,6 +147,53 @@ function buildQueryTargetDEMap() {
   }
 
   return queryToTargetDE;
+}
+
+/**
+ * Check if a DE key looks like an internal clone key
+ * Internal clone keys have pattern: __GUID_GUID_1 or similar
+ */
+function isInternalCloneKey(key) {
+  return key && key.startsWith('__') && key.endsWith('_1');
+}
+
+/**
+ * Extract base name from internal clone DE name
+ * Internal clone names have pattern: ___BaseName_1
+ */
+function extractBaseNameFromClone(name) {
+  if (!name) return null;
+  // Check for ___Name_1 pattern
+  if (name.startsWith('___') && name.endsWith('_1')) {
+    return name.slice(3, -2); // Remove ___ prefix and _1 suffix
+  }
+  return null;
+}
+
+/**
+ * Look up DE by name in SFMC
+ * @param {string} name - DE name to search for
+ * @param {object} logger - Logger instance
+ * @returns {Promise<{CustomerKey: string, Name: string}|null>}
+ */
+async function lookupDEByName(name, logger = null) {
+  try {
+    const filter = `
+      <Filter xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="SimpleFilterPart">
+        <Property>Name</Property>
+        <SimpleOperator>equals</SimpleOperator>
+        <Value>${escapeXml(name)}</Value>
+      </Filter>`;
+
+    const results = await retrieveDataExtensions(filter, logger);
+    if (results && results.length > 0) {
+      return results[0];
+    }
+    return null;
+  } catch (error) {
+    if (logger) logger.debug(`Error looking up DE by name "${name}": ${error.message}`);
+    return null;
+  }
 }
 
 /**
@@ -436,23 +483,55 @@ async function runRestoration() {
         };
 
         // Add target DE from automation steps (enriched earlier)
-        if (query._targetDEKey) {
-          queryData.DataExtensionTargetKey = query._targetDEKey;
-        } else if (query.DataExtensionTarget?.CustomerKey) {
-          queryData.DataExtensionTargetKey = query.DataExtensionTarget.CustomerKey;
+        let targetDEKey = query._targetDEKey || query.DataExtensionTarget?.CustomerKey;
+        let resolvedDEName = query._targetDEName;
+
+        // Check if target DE key is an internal clone key (e.g., __GUID_GUID_1)
+        // If so, try to look up the actual DE by extracting the base name
+        if (targetDEKey && isInternalCloneKey(targetDEKey) && query._targetDEName) {
+          const baseName = extractBaseNameFromClone(query._targetDEName);
+          if (baseName) {
+            spinner.text = `${progress} Looking up DE: ${baseName}`;
+            const foundDE = await lookupDEByName(baseName, logger);
+            if (foundDE) {
+              targetDEKey = foundDE.CustomerKey;
+              resolvedDEName = foundDE.Name;
+              spinner.text = `${progress} Creating: ${query.Name} -> ${resolvedDEName}`;
+            } else {
+              // Could not find the restored DE
+              spinner.fail(`${progress} Failed: ${query.Name} - Could not find restored DE "${baseName}"`);
+              results.failed++;
+              results.failedItems.push({
+                name: query.Name,
+                customerKey: queryData.CustomerKey,
+                error: `Could not find restored DE "${baseName}" (original: ${query._targetDEName})`,
+                attemptedAt: new Date().toISOString()
+              });
+              auditLogger.addFailure({
+                name: query.Name,
+                customerKey: queryData.CustomerKey
+              }, `Could not find restored DE "${baseName}"`);
+              await sleep(config.safety.apiRateLimitDelayMs);
+              continue;
+            }
+          }
+        }
+
+        if (targetDEKey) {
+          queryData.DataExtensionTargetKey = targetDEKey;
         }
 
         const result = await createQueryActivity(queryData, logger);
 
         if (result.success) {
-          spinner.succeed(`${progress} Created: ${query.Name} -> ${query._targetDEName || 'N/A'}`);
+          spinner.succeed(`${progress} Created: ${query.Name} -> ${resolvedDEName || 'N/A'}`);
           results.successful++;
           results.successfulItems.push({
             name: query.Name,
             customerKey: queryData.CustomerKey,
             newObjectId: result.objectId,
-            targetDE: query._targetDEKey || query.DataExtensionTarget?.CustomerKey || 'N/A',
-            targetDEName: query._targetDEName || 'N/A',
+            targetDE: targetDEKey || 'N/A',
+            targetDEName: resolvedDEName || 'N/A',
             restoredAt: new Date().toISOString()
           });
 

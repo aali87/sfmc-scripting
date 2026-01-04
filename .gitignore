@@ -38,3 +38,8 @@ coverage/
 # Build outputs
 dist/
 build/
+
+# Claude Code files
+claude.md
+CLAUDE.md
+.claude/
