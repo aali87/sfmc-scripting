@@ -7,7 +7,7 @@ import axios from 'axios';
 import { parseStringPromise, Builder } from 'xml2js';
 import { getAccessToken } from './sfmc-auth.js';
 import config from '../config/index.js';
-import { sleep, isRetryableError, calculateBackoffDelay, RETRY_CONFIG } from './utils.js';
+import { sleep, isRetryableError, calculateBackoffDelay, createConcurrencyLimiter, RETRY_CONFIG } from './utils.js';
 
 // SOAP namespaces
 const NAMESPACES = {
@@ -18,6 +18,28 @@ const NAMESPACES = {
 };
 
 const { MAX_RETRIES, RETRY_DELAY_MS } = RETRY_CONFIG;
+
+/**
+ * Redact sensitive data from objects before logging
+ * @param {any} obj - Object to redact
+ * @param {string[]} sensitiveKeys - Array of key substrings to match (case insensitive)
+ * @returns {any} Redacted copy of the object
+ */
+function redactSensitiveData(obj, sensitiveKeys = ['token', 'secret', 'password', 'credential', 'auth', 'key', 'authorization']) {
+  if (typeof obj !== 'object' || obj === null) return obj;
+
+  const redacted = Array.isArray(obj) ? [...obj] : { ...obj };
+
+  for (const key in redacted) {
+    if (sensitiveKeys.some(sk => key.toLowerCase().includes(sk))) {
+      redacted[key] = '[REDACTED]';
+    } else if (typeof redacted[key] === 'object') {
+      redacted[key] = redactSensitiveData(redacted[key], sensitiveKeys);
+    }
+  }
+
+  return redacted;
+}
 
 /**
  * Build SOAP envelope with fueloauth header (OAuth 2.0)
@@ -70,10 +92,12 @@ async function parseSoapResponse(xmlResponse) {
  * @param {string} soapBody - SOAP body content
  * @param {object} logger - Logger instance
  * @param {number} retryCount - Current retry count
+ * @param {string} soapAction - SOAP action header value
+ * @param {string} accountId - Business Unit account ID (optional, defaults to config)
  * @returns {Promise<object>} Parsed response body
  */
-async function makeSoapRequest(soapBody, logger, retryCount = 0, soapAction = 'Retrieve') {
-  const tokenInfo = await getAccessToken(logger);
+async function makeSoapRequest(soapBody, logger, retryCount = 0, soapAction = 'Retrieve', accountId = null) {
+  const tokenInfo = await getAccessToken(logger, accountId);
   const envelope = buildSoapEnvelope(tokenInfo.accessToken, soapBody);
 
   // Get SOAP URL and ensure it ends with /Service.asmx
@@ -92,7 +116,7 @@ async function makeSoapRequest(soapBody, logger, retryCount = 0, soapAction = 'R
         'Content-Type': 'text/xml; charset=utf-8',
         'SOAPAction': soapAction
       },
-      timeout: 120000 // 2 minute timeout for SOAP calls
+      timeout: config.timeouts.soapTimeoutMs
     });
 
     // Rate limit delay
@@ -108,7 +132,7 @@ async function makeSoapRequest(soapBody, logger, retryCount = 0, soapAction = 'R
         logger.warn(`Request failed, retrying in ${delay}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`);
       }
       await sleep(delay);
-      return makeSoapRequest(soapBody, logger, retryCount + 1, soapAction);
+      return makeSoapRequest(soapBody, logger, retryCount + 1, soapAction, accountId);
     }
 
     // Handle specific error types
@@ -150,9 +174,14 @@ function buildSimpleFilter(property, operator, value) {
  * Build a complex filter with AND/OR logic
  * @param {string} logicalOperator - 'AND' or 'OR'
  * @param {string[]} filterParts - Array of filter XML strings
- * @returns {string} Complex filter XML
+ * @returns {string} Complex filter XML, or empty string if no filter parts
  */
 function buildComplexFilter(logicalOperator, filterParts) {
+  // Guard against empty array
+  if (!filterParts || filterParts.length === 0) {
+    return '';
+  }
+
   if (filterParts.length === 1) {
     return filterParts[0];
   }
@@ -171,12 +200,18 @@ function buildComplexFilter(logicalOperator, filterParts) {
 }
 
 /**
- * Escape special XML characters
+ * Escape special XML characters and remove invalid XML 1.0 characters
  * @param {string} str - String to escape
- * @returns {string} Escaped string
+ * @returns {string} Escaped string safe for XML 1.0
  */
 function escapeXml(str) {
-  return str
+  if (str === null || str === undefined) return '';
+  return String(str)
+    // Remove null bytes
+    .replace(/\x00/g, '')
+    // Remove invalid XML 1.0 control characters (keep \t, \n, \r)
+    .replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+    // Then do standard XML escaping
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -192,7 +227,7 @@ function escapeXml(str) {
  * @param {object} logger - Logger instance
  * @returns {Promise<object[]>} Array of retrieved objects
  */
-export async function retrieve(objectType, properties, filter = null, logger = null) {
+export async function retrieve(objectType, properties, filter = null, logger = null, accountId = null) {
   const allResults = [];
   let requestId = null;
   let hasMore = true;
@@ -222,7 +257,7 @@ export async function retrieve(objectType, properties, filter = null, logger = n
         </RetrieveRequestMsg>`;
     }
 
-    const body = await makeSoapRequest(soapBody, logger);
+    const body = await makeSoapRequest(soapBody, logger, 0, 'Retrieve', accountId);
     const response = body.RetrieveResponseMsg;
 
     if (!response) {
@@ -252,7 +287,7 @@ export async function retrieve(objectType, properties, filter = null, logger = n
         errorMsg = response.OverallStatusMessage;
       }
       if (logger) {
-        logger.debug(`SOAP Error Response: ${JSON.stringify(response)}`);
+        logger.debug(`SOAP Error Response: ${JSON.stringify(redactSensitiveData(response))}`);
       }
       throw new Error(`Retrieve failed: ${errorMsg}`);
     }
@@ -287,7 +322,7 @@ export async function retrieve(objectType, properties, filter = null, logger = n
  * @param {object} logger - Logger instance
  * @returns {Promise<object>} Delete result
  */
-export async function deleteObjects(objectType, objects, logger = null) {
+export async function deleteObjects(objectType, objects, logger = null, accountId = null) {
   if (objects.length === 0) {
     return { success: true, deleted: 0 };
   }
@@ -309,10 +344,10 @@ export async function deleteObjects(objectType, objects, logger = null) {
       ${objectsXml}
     </DeleteRequest>`;
 
-  const body = await makeSoapRequest(soapBody, logger, 0, 'Delete');
+  const body = await makeSoapRequest(soapBody, logger, 0, 'Delete', accountId);
 
   if (logger) {
-    logger.debug(`Delete response body: ${JSON.stringify(body)}`);
+    logger.debug(`Delete response body: ${JSON.stringify(redactSensitiveData(body))}`);
   }
 
   const response = body.DeleteResponse;
@@ -322,16 +357,27 @@ export async function deleteObjects(objectType, objects, logger = null) {
     if (body.DeleteResponseMsg) {
       const deleteResponse = body.DeleteResponseMsg;
       if (logger) {
-        logger.debug(`Found DeleteResponseMsg: ${JSON.stringify(deleteResponse)}`);
+        logger.debug(`Found DeleteResponseMsg: ${JSON.stringify(redactSensitiveData(deleteResponse))}`);
       }
     }
     throw new Error('Invalid SOAP response: missing DeleteResponse');
   }
 
+  // Check for results existence
+  if (!response.Results) {
+    return { success: false, error: 'Invalid SOAP response: missing Results', deleted: 0, failed: 0, results: [] };
+  }
+
   // Parse results
   const results = Array.isArray(response.Results) ? response.Results : [response.Results];
-  const successful = results.filter(r => r.StatusCode === 'OK');
-  const failed = results.filter(r => r.StatusCode !== 'OK');
+
+  // Check for empty results
+  if (results.length === 0 || !results[0]) {
+    return { success: false, error: 'Invalid SOAP response: empty Results', deleted: 0, failed: 0, results: [] };
+  }
+
+  const successful = results.filter(r => r && r.StatusCode === 'OK');
+  const failed = results.filter(r => r && r.StatusCode !== 'OK');
 
   if (logger) {
     logger.debug(`Delete complete: ${successful.length} success, ${failed.length} failed`);
@@ -355,14 +401,14 @@ export async function deleteObjects(objectType, objects, logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<object[]>} Array of folder objects
  */
-export async function retrieveFolders(filter = null, logger = null) {
+export async function retrieveFolders(filter = null, logger = null, accountId = null) {
   const properties = [
     'ID', 'Name', 'Description', 'ContentType', 'ParentFolder.ID',
     'ParentFolder.Name', 'CustomerKey', 'IsActive', 'IsEditable',
     'AllowChildren', 'CreatedDate', 'ModifiedDate', 'ObjectID'
   ];
 
-  return retrieve('DataFolder', properties, filter, logger);
+  return retrieve('DataFolder', properties, filter, logger, accountId);
 }
 
 /**
@@ -371,7 +417,7 @@ export async function retrieveFolders(filter = null, logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<object[]>} Array of DE objects
  */
-export async function retrieveDataExtensions(filter = null, logger = null) {
+export async function retrieveDataExtensions(filter = null, logger = null, accountId = null) {
   const properties = [
     'ObjectID', 'CustomerKey', 'Name', 'Description', 'IsSendable',
     'IsTestable', 'SendableSubscriberField.Name', 'SendableDataExtensionField.Name',
@@ -380,7 +426,7 @@ export async function retrieveDataExtensions(filter = null, logger = null) {
     'RowBasedRetention', 'ResetRetentionPeriodOnImport', 'DeleteAtEndOfRetentionPeriod'
   ];
 
-  return retrieve('DataExtension', properties, filter, logger);
+  return retrieve('DataExtension', properties, filter, logger, accountId);
 }
 
 /**
@@ -389,7 +435,7 @@ export async function retrieveDataExtensions(filter = null, logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<object[]>} Array of field objects
  */
-export async function retrieveDataExtensionFields(deCustomerKey, logger = null) {
+export async function retrieveDataExtensionFields(deCustomerKey, logger = null, accountId = null) {
   const properties = [
     'ObjectID', 'CustomerKey', 'Name', 'DefaultValue', 'FieldType',
     'IsPrimaryKey', 'IsRequired', 'MaxLength', 'Scale', 'Ordinal'
@@ -402,7 +448,7 @@ export async function retrieveDataExtensionFields(deCustomerKey, logger = null) 
       <Value>${escapeXml(deCustomerKey)}</Value>
     </Filter>`;
 
-  return retrieve('DataExtensionField', properties, filter, logger);
+  return retrieve('DataExtensionField', properties, filter, logger, accountId);
 }
 
 /**
@@ -410,7 +456,7 @@ export async function retrieveDataExtensionFields(deCustomerKey, logger = null) 
  * @param {object} logger - Logger instance
  * @returns {Promise<object[]>} Array of TSD objects
  */
-export async function retrieveTriggeredSendDefinitions(logger = null) {
+export async function retrieveTriggeredSendDefinitions(logger = null, accountId = null) {
   // Valid TriggeredSendDefinition properties (SFMC SOAP API)
   const properties = [
     'ObjectID', 'CustomerKey', 'Name', 'Description', 'TriggeredSendStatus',
@@ -418,7 +464,7 @@ export async function retrieveTriggeredSendDefinitions(logger = null) {
     'SendClassification.CustomerKey', 'SenderProfile.CustomerKey'
   ];
 
-  return retrieve('TriggeredSendDefinition', properties, null, logger);
+  return retrieve('TriggeredSendDefinition', properties, null, logger, accountId);
 }
 
 /**
@@ -426,20 +472,23 @@ export async function retrieveTriggeredSendDefinitions(logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<object[]>} Array of query objects
  */
-export async function retrieveQueryDefinitions(logger = null, includeQueryText = false) {
+export async function retrieveQueryDefinitions(logger = null, includeQueryText = false, accountId = null) {
   // Valid QueryDefinition properties (SFMC SOAP API)
   // NOTE: QueryText is excluded from bulk retrieval by default as it can cause SFMC to return
   // HTML error pages instead of SOAP responses when there's a lot of data.
   const properties = [
     'ObjectID', 'CustomerKey', 'Name', 'Description',
-    'TargetType', 'TargetUpdateType', 'CategoryID'
+    'TargetType', 'TargetUpdateType', 'CategoryID',
+    // Target DE properties - critical for detecting DEs used as query destinations
+    'DataExtensionTarget.CustomerKey',
+    'DataExtensionTarget.Name'
   ];
 
   if (includeQueryText) {
     properties.push('QueryText');
   }
 
-  return retrieve('QueryDefinition', properties, null, logger);
+  return retrieve('QueryDefinition', properties, null, logger, accountId);
 }
 
 /**
@@ -449,15 +498,20 @@ export async function retrieveQueryDefinitions(logger = null, includeQueryText =
  * @param {object} logger - Logger instance
  * @returns {Promise<Map<string, string>>} Map of ObjectID -> QueryText
  */
-export async function retrieveQueryTexts(objectIds, logger = null, concurrency = 10) {
+export async function retrieveQueryTexts(objectIds, logger = null, concurrency = null, accountId = null) {
   if (!objectIds || objectIds.length === 0) {
     return new Map();
   }
 
   const results = new Map();
 
-  // Process in parallel with controlled concurrency
-  // This is much faster than sequential but still avoids overwhelming the API
+  // Use config default if concurrency not specified
+  const effectiveConcurrency = concurrency || config.concurrency.queryTextConcurrency;
+
+  // Use concurrency limiter for proper flow control
+  // This ensures exactly `concurrency` requests are in flight at any time
+  const limit = createConcurrencyLimiter(effectiveConcurrency);
+
   const fetchQueryText = async (objectId) => {
     const filter = buildSimpleFilter('ObjectID', 'equals', objectId);
 
@@ -466,7 +520,8 @@ export async function retrieveQueryTexts(objectIds, logger = null, concurrency =
         'QueryDefinition',
         ['ObjectID', 'QueryText'],
         filter,
-        null // Don't pass logger to avoid flooding logs
+        null, // Don't pass logger to avoid flooding logs
+        accountId
       );
 
       for (const q of queries) {
@@ -479,16 +534,8 @@ export async function retrieveQueryTexts(objectIds, logger = null, concurrency =
     }
   };
 
-  // Process in chunks with concurrency limit
-  for (let i = 0; i < objectIds.length; i += concurrency) {
-    const chunk = objectIds.slice(i, i + concurrency);
-    await Promise.all(chunk.map(fetchQueryText));
-
-    // Brief pause between chunks to be gentle on the API
-    if (i + concurrency < objectIds.length) {
-      await sleep(100);
-    }
-  }
+  // Process all with concurrency limiter - maintains exactly `concurrency` in flight
+  await Promise.all(objectIds.map(id => limit(() => fetchQueryText(id))));
 
   return results;
 }
@@ -498,36 +545,40 @@ export async function retrieveQueryTexts(objectIds, logger = null, concurrency =
  * @param {object} logger - Logger instance
  * @returns {Promise<object[]>} Array of import definition objects
  */
-export async function retrieveImportDefinitions(logger = null) {
+export async function retrieveImportDefinitions(logger = null, accountId = null) {
   // Valid ImportDefinition properties (SFMC SOAP API)
-  // DestinationObject.ObjectID returns the DE's ObjectID
+  // DestinationObject properties return the target DE information
   const properties = [
     'ObjectID', 'CustomerKey', 'Name', 'Description',
     'DestinationObject.ObjectID',
+    'DestinationObject.CustomerKey',
+    'DestinationObject.Name',
     'UpdateType', 'FileSpec', 'FieldMappingType', 'FileType'
   ];
 
-  return retrieve('ImportDefinition', properties, null, logger);
+  return retrieve('ImportDefinition', properties, null, logger, accountId);
 }
 
 /**
  * Delete a Data Extension
  * @param {string} customerKey - DE CustomerKey
  * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional, defaults to config)
  * @returns {Promise<object>} Delete result
  */
-export async function deleteDataExtension(customerKey, logger = null) {
-  return deleteObjects('DataExtension', [{ CustomerKey: customerKey }], logger);
+export async function deleteDataExtension(customerKey, logger = null, accountId = null) {
+  return deleteObjects('DataExtension', [{ CustomerKey: customerKey }], logger, accountId);
 }
 
 /**
  * Delete a folder
  * @param {number} folderId - Folder CategoryID
  * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional, defaults to config)
  * @returns {Promise<object>} Delete result
  */
-export async function deleteFolder(folderId, logger = null) {
-  return deleteObjects('DataFolder', [{ ID: folderId }], logger);
+export async function deleteFolder(folderId, logger = null, accountId = null) {
+  return deleteObjects('DataFolder', [{ ID: folderId }], logger, accountId);
 }
 
 // Export filter builders
@@ -537,10 +588,11 @@ export { buildSimpleFilter, buildComplexFilter, escapeXml };
  * Delete a Query Activity (QueryDefinition) by ObjectID
  * @param {string} objectId - The ObjectID of the query to delete
  * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional, defaults to config)
  * @returns {Promise<object>} Delete result
  */
-export async function deleteQueryActivity(objectId, logger = null) {
-  return deleteObjects('QueryDefinition', [{ ObjectID: objectId }], logger);
+export async function deleteQueryActivity(objectId, logger = null, accountId = null) {
+  return deleteObjects('QueryDefinition', [{ ObjectID: objectId }], logger, accountId);
 }
 
 /**
@@ -556,7 +608,7 @@ export async function deleteQueryActivity(objectId, logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<object>} Create result with success flag and objectId
  */
-export async function createQueryActivity(queryData, logger = null) {
+export async function createQueryActivity(queryData, logger = null, accountId = null) {
   const {
     Name,
     CustomerKey = Name,
@@ -600,10 +652,10 @@ export async function createQueryActivity(queryData, logger = null) {
     </CreateRequest>`;
 
   try {
-    const body = await makeSoapRequest(soapBody, logger, 0, 'Create');
+    const body = await makeSoapRequest(soapBody, logger, 0, 'Create', accountId);
 
     if (logger) {
-      logger.debug(`Create response body: ${JSON.stringify(body)}`);
+      logger.debug(`Create response body: ${JSON.stringify(redactSensitiveData(body))}`);
     }
 
     const response = body.CreateResponse;
@@ -612,8 +664,19 @@ export async function createQueryActivity(queryData, logger = null) {
       return { success: false, error: 'Invalid SOAP response: missing CreateResponse' };
     }
 
+    // Check for results existence
+    if (!response.Results) {
+      return { success: false, error: 'Invalid SOAP response: missing Results' };
+    }
+
     // Parse results
     const results = Array.isArray(response.Results) ? response.Results : [response.Results];
+
+    // Check for empty results
+    if (results.length === 0 || !results[0]) {
+      return { success: false, error: 'Invalid SOAP response: empty Results' };
+    }
+
     const result = results[0];
 
     if (result.StatusCode === 'OK') {
@@ -652,7 +715,7 @@ export async function createQueryActivity(queryData, logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<object>} Create result with success flag and objectId
  */
-export async function createDataExtension(deData, logger = null) {
+export async function createDataExtension(deData, logger = null, accountId = null) {
   const {
     Name,
     CustomerKey,
@@ -760,10 +823,10 @@ export async function createDataExtension(deData, logger = null) {
   }
 
   try {
-    const body = await makeSoapRequest(soapBody, logger, 0, 'Create');
+    const body = await makeSoapRequest(soapBody, logger, 0, 'Create', accountId);
 
     if (logger) {
-      logger.debug(`Create DE response body: ${JSON.stringify(body)}`);
+      logger.debug(`Create DE response body: ${JSON.stringify(redactSensitiveData(body))}`);
     }
 
     const response = body.CreateResponse;
@@ -772,8 +835,19 @@ export async function createDataExtension(deData, logger = null) {
       return { success: false, error: 'Invalid SOAP response: missing CreateResponse' };
     }
 
+    // Check for results existence
+    if (!response.Results) {
+      return { success: false, error: 'Invalid SOAP response: missing Results' };
+    }
+
     // Parse results
     const results = Array.isArray(response.Results) ? response.Results : [response.Results];
+
+    // Check for empty results
+    if (results.length === 0 || !results[0]) {
+      return { success: false, error: 'Invalid SOAP response: empty Results' };
+    }
+
     const result = results[0];
 
     if (result.StatusCode === 'OK') {

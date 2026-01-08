@@ -9,6 +9,7 @@
  */
 
 import fs from 'fs/promises';
+import fsSync from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { sleep, CACHE_CONFIG } from './utils.js';
@@ -24,6 +25,63 @@ const {
   LOCK_RETRY_DELAY_MS,
   LOCK_MAX_RETRIES
 } = CACHE_CONFIG;
+
+// Track active locks for cleanup on process exit
+const activeLocks = new Set();
+
+/**
+ * Synchronous cleanup of all active lock files
+ * Used during process exit when async operations are not available
+ */
+function cleanupLocksSync() {
+  for (const lockPath of activeLocks) {
+    try {
+      fsSync.unlinkSync(lockPath);
+    } catch (e) {
+      // Ignore errors during cleanup - file may already be deleted
+    }
+  }
+  activeLocks.clear();
+}
+
+// Register cleanup handlers (only once)
+let cleanupRegistered = false;
+function registerCleanupHandlers() {
+  if (cleanupRegistered) return;
+  cleanupRegistered = true;
+
+  // Normal exit
+  process.on('exit', cleanupLocksSync);
+
+  // Ctrl+C
+  process.on('SIGINT', () => {
+    cleanupLocksSync();
+    process.exit(130);
+  });
+
+  // Termination signal
+  process.on('SIGTERM', () => {
+    cleanupLocksSync();
+    process.exit(143);
+  });
+
+  // Uncaught exceptions
+  process.on('uncaughtException', (error) => {
+    cleanupLocksSync();
+    console.error('Uncaught exception:', error);
+    process.exit(1);
+  });
+
+  // Unhandled promise rejections
+  process.on('unhandledRejection', (reason, promise) => {
+    cleanupLocksSync();
+    console.error('Unhandled rejection at:', promise, 'reason:', reason);
+    process.exit(1);
+  });
+}
+
+// Register handlers immediately when module loads
+registerCleanupHandlers();
 
 /**
  * Ensure cache directory exists
@@ -64,6 +122,7 @@ async function acquireLock(cacheFilePath) {
       });
 
       await fs.writeFile(lockPath, lockData, { flag: 'wx' });
+      activeLocks.add(lockPath);  // Track for cleanup on crash
       return true; // Lock acquired
     } catch (error) {
       if (error.code === 'EEXIST') {
@@ -109,6 +168,7 @@ async function releaseLock(cacheFilePath) {
   } catch (error) {
     // Lock may already be released
   }
+  activeLocks.delete(lockPath);  // Remove from tracking
 }
 
 /**
@@ -153,7 +213,23 @@ export async function readCache(cacheType, accountId, options = {}) {
 
     return cache;
   } catch (error) {
-    // File doesn't exist or is invalid
+    // Handle different error types appropriately
+    if (error.code === 'ENOENT') {
+      // File doesn't exist - normal case, no logging needed
+      return null;
+    }
+    if (error instanceof SyntaxError) {
+      // Invalid JSON - cache file is corrupted, silently return null
+      // File will be overwritten on next cache write
+      return null;
+    }
+    if (error.code === 'EACCES' || error.code === 'EPERM') {
+      // Permission error - log warning as this may need attention
+      console.warn(`Cache read permission error for ${cacheType}/${accountId}: ${error.message}`);
+      return null;
+    }
+    // For other unexpected errors, log but don't throw
+    console.warn(`Unexpected cache read error for ${cacheType}/${accountId}: ${error.message}`);
     return null;
   }
 }

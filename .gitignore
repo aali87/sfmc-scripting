@@ -35,6 +35,15 @@ Thumbs.db
 # Test coverage
 coverage/
 
+# Data files
+*.csv
+*.json.bak
+
+# Debug/test files at root
+debug-*.js
+test-*.js
+*ACTION_PLAN*.md
+
 # Build outputs
 dist/
 build/

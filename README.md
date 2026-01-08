@@ -1,27 +1,44 @@
 # SFMC Data Extension Toolkit
 
-A comprehensive Node.js toolkit for Salesforce Marketing Cloud (SFMC) Data Extension management. Audit folder contents, analyze dependencies with smart classification, and safely delete Data Extensions, Query Activities, Automations, and Folders with full audit logging.
+A Node.js CLI toolkit for Salesforce Marketing Cloud (SFMC) Data Extension management. Safely audit, analyze dependencies, and delete Data Extensions, Query Activities, Automations, and Folders.
 
-## Key Features
+## Features
 
-### Smart Dependency Analysis
-- **Intelligent Classification** - Dependencies are classified as "Safe to Delete" or "Requires Review"
-- **Bulk Data Loading** - Loads all SFMC metadata upfront with 24-hour caching for fast analysis
-- **Query SQL Parsing** - Detects DE references in SQL queries by CustomerKey AND Name
-- **Automation Context** - Identifies stale automations (never run, stopped, 90+ days inactive)
+- **Safe by Default** - All deletions are dry-run; use `--confirm` for live execution
+- **Smart Dependency Analysis** - Detects references in queries, automations, journeys, and triggered sends
+- **Multi-Business Unit Support** - Analyze and manage DEs across different Business Units
+- **Bulk Metadata Caching** - 24-hour cache minimizes API calls for fast repeated analysis
+- **Automatic Backups** - Schema backups created before any deletion
+- **Resumable Operations** - Interrupted operations can be resumed from saved state
 
-### Safe Deletion Workflows
-- **Dry-Run by Default** - All delete operations preview changes without modifying anything
-- **Multi-Step Confirmation** - Live deletions require typing confirmation phrases
-- **Auto-Delete Safe Dependencies** - Optionally delete standalone filters, stale automations, and queries
-- **Schema Backups** - Automatic JSON backups before deletion
-- **Undo Scripts** - Templates to recreate deleted DEs
+---
 
-### Comprehensive Auditing
-- **Folder Audits** - Generate detailed reports of folder contents
-- **Dependency Reports** - Export to CSV with classification details
-- **Audit Logging** - Full compliance trail for all operations
-- **Protected Items** - System DEs and folders are automatically detected and skipped
+## Quick Start
+
+```bash
+# 1. Clone and install
+git clone https://github.com/yourusername/sfmc-de-toolkit.git
+cd sfmc-de-toolkit
+npm install
+
+# 2. Configure credentials
+cp .env.example .env
+# Edit .env with your SFMC credentials (see Configuration section)
+
+# 3. Test connection
+node src/index.js test
+
+# 4. Audit a folder (read-only)
+node src/scripts/audit-folder.js --folder "Data Extensions/Archive"
+
+# 5. Preview deletion (dry-run)
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive"
+
+# 6. Delete with confirmation
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" --confirm
+```
+
+---
 
 ## Prerequisites
 
@@ -41,27 +58,11 @@ Create a **Server-to-Server** installed package in SFMC with these permissions:
 - Node.js 18.0.0 or higher
 - npm
 
-## Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/sfmc-de-toolkit.git
-cd sfmc-de-toolkit
-
-# Install dependencies
-npm install
-
-# Copy environment template
-cp .env.example .env
-
-# Edit .env with your SFMC credentials
-```
+---
 
 ## Configuration
 
-### Environment Variables
-
-Edit `.env` with your SFMC credentials:
+Create a `.env` file with your SFMC credentials:
 
 ```env
 # Required - from your SFMC Installed Package
@@ -70,267 +71,256 @@ SFMC_CLIENT_SECRET=your_client_secret
 SFMC_ACCOUNT_ID=your_mid
 SFMC_SUBDOMAIN=your_subdomain
 
-# Or use explicit URLs
+# Optional - explicit URLs (auto-generated from subdomain if not set)
 SFMC_AUTH_URL=https://YOUR_SUBDOMAIN.auth.marketingcloudapis.com
 SFMC_SOAP_URL=https://YOUR_SUBDOMAIN.soap.marketingcloudapis.com/Service.asmx
 SFMC_REST_URL=https://YOUR_SUBDOMAIN.rest.marketingcloudapis.com
 
-# Safety Settings
-PROTECTED_FOLDER_PATTERNS=System,CASL,Shared Data Extensions,Platform
-PROTECTED_DE_PREFIXES=SYS_,CASL_,_Subscribers,_Bounce
-
-# Rate Limiting
-API_RATE_LIMIT_DELAY_MS=200
-MAX_DELETE_BATCH_SIZE=50
-
-# Optional
+# Optional - logging
 LOG_LEVEL=info
+
+# Optional - webhook notifications
 WEBHOOK_URL=https://hooks.slack.com/services/...
 ```
 
-### Protected Patterns
+### Environment Variable Reference
 
-The toolkit automatically protects system items from accidental deletion:
+| Category | Variable | Default | Description |
+|----------|----------|---------|-------------|
+| **Timeouts** | `SOAP_TIMEOUT_MS` | 120000 | SOAP API timeout (2 min) |
+| | `REST_TIMEOUT_MS` | 60000 | REST API timeout (1 min) |
+| **Pagination** | `DEFAULT_PAGE_SIZE` | 500 | API pagination size |
+| | `JOURNEY_PAGE_SIZE` | 100 | Journey API page size |
+| **Concurrency** | `QUERY_TEXT_CONCURRENCY` | 25 | Parallel query SQL requests |
+| | `AUTOMATION_DETAILS_CONCURRENCY` | 10 | Parallel automation requests |
+| **Safety** | `PROTECTED_FOLDER_PATTERNS` | System,CASL,... | Folders to protect |
+| | `PROTECTED_DE_PREFIXES` | SYS_,CASL_,... | DE prefixes to protect |
 
-**Protected Folder Patterns:**
-- System, CASL, Platform, Salesforce, Einstein
-- Contact Builder, MobileConnect, CloudPages, Synchronized
+---
 
-**Protected DE Prefixes:**
-- SYS_, CASL_
-- _Subscribers, _Bounce, _Click, _Job, _Journey, _Open, _Sent
-- ent., ContactMaster
+## Commands
 
-## Quick Start
+### Test Connection
 
 ```bash
-# 1. Test your connection
 node src/index.js test
-
-# 2. Sync folder cache (optional, auto-syncs on first run)
-node src/index.js sync
-
-# 3. Audit a folder (read-only)
-node src/scripts/audit-folder.js --folder "Data Extensions/Archive"
-
-# 4. Preview DE deletion (dry-run)
-node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive"
-
-# 5. Delete with auto-cleanup of safe dependencies
-node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" \
-  --delete-safe-dependencies --confirm
 ```
 
-## Scripts
+Verifies your SFMC credentials and API connectivity.
 
-### Audit Folder (Read-Only)
-
-Generate comprehensive reports of folder contents with dependency analysis:
+### Sync Cache
 
 ```bash
-node src/scripts/audit-folder.js --folder "Data Extensions/Archive" [options]
+node src/index.js sync              # Refresh folder cache
+node src/index.js sync --status     # Check cache status
+node src/index.js sync --clear      # Clear all cached data
 ```
+
+### Audit Folder
+
+Generate a read-only report of folder contents with dependency analysis:
+
+```bash
+node src/scripts/audit-folder.js --folder "Data Extensions/Archive"
+```
+
+**Options:**
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--folder, -f` | Folder path to audit (required) | - |
-| `--output, -o` | Output format: console, json, csv, all | all |
-| `--check-dependencies, -d` | Run smart dependency analysis | true |
-| `--include-row-counts, -r` | Include record counts per DE | true |
-| `--max-depth` | Maximum subfolder depth | unlimited |
-| `--refresh-cache` | Force refresh from SFMC API | false |
+| `--output, -o` | Format: console, json, csv, all | all |
+| `--check-dependencies, -d` | Run dependency analysis | true |
+| `--include-row-counts, -r` | Include record counts | true |
+| `--refresh-cache` | Force refresh from API | false |
 
-**Output Files:**
-- `audit/audit-des-YYYYMMDD-HHmmss.csv` - DE list with dependency classifications
-- `audit/audit-dependencies-YYYYMMDD-HHmmss.csv` - All dependencies with status
-- `audit/audit-YYYYMMDD-HHmmss.json` - Complete audit data
+**Output files** are saved to the `audit/` directory.
+
+### Analyze Business Unit
+
+Analyze all DEs in a Business Unit with deletion recommendations:
+
+```bash
+node src/index.js analyze-bu --bu 123456
+node src/index.js analyze-bu --bu 123456 -o report.csv --stale-years 2
+```
+
+**Options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--business-unit, --bu` | Business Unit MID (required) | - |
+| `--stale-years` | Years of inactivity threshold | 3 |
+| `--output, -o` | CSV output file path | auto-generated |
+| `--refresh-cache` | Force refresh cached data | false |
+| `--verbose, -v` | Verbose output | false |
+| `--limit` | Limit DEs (for testing) | - |
+
+**Recommendation Categories:**
+
+| Category | Description |
+|----------|-------------|
+| KEEP | Recent activity detected |
+| RECOMMEND_DELETE | All automations inactive for 3+ years |
+| SAFE_TO_DELETE | No dependencies found |
+| REVIEW | Used in Journey/Triggered Send |
 
 ### Delete Data Extensions
 
-Delete DEs within a folder with comprehensive dependency handling:
+Delete DEs within a folder with dependency handling:
 
 ```bash
-node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" [options]
+# Dry-run (preview only)
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive"
+
+# Live deletion
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" --confirm
+
+# With automatic cleanup of safe dependencies
+node src/scripts/delete-data-extensions.js --folder "Data Extensions/Archive" \
+  --delete-safe-dependencies --confirm
 ```
+
+**Options:**
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--folder, -f` | Folder containing DEs (required) | - |
-| `--dry-run` | Preview only, no deletions | true |
-| `--confirm` | Enable actual deletion mode | false |
-| `--delete-safe-dependencies` | Auto-delete safe dependencies (filters, stale automations) | false |
-| `--delete-query-dependencies` | Also delete Query Activities referencing DEs | false |
-| `--skip-dependency-check` | Skip dependency validation | false |
-| `--force-delete-with-dependencies` | Delete despite blocking dependencies | false |
-| `--skip-protected` | Skip protected DEs instead of aborting | false |
-| `--backup-schemas` | Backup DE schemas before deletion | true |
-| `--older-than-days` | Only delete DEs not modified in X days | - |
-| `--exclude-pattern` | Regex pattern for DE names to exclude | - |
-| `--include-pattern` | Regex pattern for DE names to include | - |
-| `--batch-size` | Number of DEs to delete per batch | 10 |
+| `--confirm` | Enable actual deletion | false |
+| `--delete-safe-dependencies` | Auto-delete safe deps | false |
+| `--delete-query-dependencies` | Also delete Query Activities | false |
+| `--skip-protected` | Skip protected DEs | false |
+| `--older-than-days` | Only delete if not modified in X days | - |
+| `--include-pattern` | Regex for DE names to include | - |
+| `--exclude-pattern` | Regex for DE names to exclude | - |
 | `--interactive, -i` | Select DEs interactively | false |
-| `--resume` | Resume a previous operation by ID | - |
-| `--non-interactive` | Non-interactive mode for automation | false |
-| `--confirm-phrase` | Confirmation phrase for non-interactive mode | - |
-| `--webhook-url` | URL to POST results to | - |
-| `--refresh-cache` | Force refresh cache from API | false |
+| `--resume` | Resume previous operation by ID | - |
 
-**Dependency Classification:**
+### Delete Folders
 
-| Classification | Description | Auto-Deletable |
-|----------------|-------------|----------------|
-| Safe to Delete | Standalone filters, stale automations (stopped/never run/90+ days inactive) | Yes |
-| Requires Review | Active automations, journeys, triggered sends | No |
-
-**Examples:**
+Delete folders (must be empty unless `--force`):
 
 ```bash
-# Preview what would be deleted
-node src/scripts/delete-data-extensions.js --folder "Archive/2023"
-
-# Delete DEs with automatic cleanup of safe dependencies
-node src/scripts/delete-data-extensions.js --folder "Archive/2023" \
-  --delete-safe-dependencies --confirm
-
-# Delete DEs and their Query Activities
-node src/scripts/delete-data-extensions.js --folder "Archive/2023" \
-  --delete-safe-dependencies --delete-query-dependencies --confirm
-
-# Delete only DEs older than 90 days
-node src/scripts/delete-data-extensions.js --folder "Archive" \
-  --older-than-days 90 --confirm
-
-# Interactive selection mode
-node src/scripts/delete-data-extensions.js --folder "Archive" --interactive
+node src/scripts/delete-folders.js --folder "Data Extensions/Archive" --confirm
 ```
 
 ### Delete Automations
 
-Delete automations by name with backup and safety checks:
+Delete automations by name:
 
 ```bash
-node src/scripts/delete-automations.js --file automations.txt [options]
-node src/scripts/delete-automations.js --names "Auto1,Auto2,Auto3" [options]
+node src/scripts/delete-automations.js --file automations.txt --confirm
+node src/scripts/delete-automations.js --names "Auto1,Auto2" --confirm
 ```
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--file, -f` | Path to file with automation names (one per line) | - |
-| `--names, -n` | Comma-separated list of automation names | - |
-| `--dry-run` | Preview only, no deletions | true |
-| `--confirm` | Enable actual deletion mode | false |
-| `--backup` | Backup automation configs before deletion | true |
-| `--skip-running` | Skip automations currently running | true |
-| `--force-delete-running` | Delete even if running (dangerous) | false |
-| `--batch-size` | Automations to delete before pausing | 5 |
-| `--interactive, -i` | Select automations interactively | false |
-| `--non-interactive` | Non-interactive mode for automation | false |
-| `--confirm-phrase` | Confirmation phrase for non-interactive mode | - |
+### Audit CloudPages
 
-### Delete Folders
-
-Delete folders and subfolders (must be empty unless --force):
+Scan CloudPage HTML for patterns (e.g., font references):
 
 ```bash
-node src/scripts/delete-folders.js --folder "Data Extensions/Archive" [options]
+node src/scripts/audit-cloudpages.js --bu 123456
+node src/scripts/audit-cloudpages.js --bu 123456 --search "DAX,Arial" -o report.csv
 ```
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--folder, -f` | Folder path to delete (required) | - |
-| `--dry-run` | Preview only | true |
-| `--confirm` | Enable actual deletion | false |
-| `--force` | Delete folder contents first | false |
-| `--skip-protected` | Skip protected folders instead of aborting | false |
-| `--non-interactive` | Non-interactive mode | false |
-| `--confirm-phrase` | Confirmation phrase for non-interactive mode | - |
-| `--webhook-url` | URL to POST results to | - |
-| `--refresh-cache` | Force refresh cache from API | false |
+### Update Automation Query ObjectIDs
+
+Update query references in automations after query recreation:
+
+```bash
+# Dry-run
+node src/scripts/update-automation-query-objectids.js --automation-id "guid" --bu 123456
+
+# Apply changes
+node src/scripts/update-automation-query-objectids.js --automation-id "guid" --bu 123456 --confirm
+```
+
+---
+
+## Safety Features
+
+### Dry-Run by Default
+
+All delete operations preview changes without modifying anything. Use `--confirm` to execute.
+
+### Multi-Step Confirmation
+
+Live deletions require typing an exact phrase:
+
+```
+Type 'DELETE 15 DATA EXTENSIONS' to confirm:
+```
+
+### Protected Items
+
+System folders and DEs are automatically protected:
+
+**Protected Folders:** System, CASL, Platform, Salesforce, Einstein, Contact Builder, MobileConnect, CloudPages, Synchronized
+
+**Protected DE Prefixes:** SYS_, CASL_, _Subscribers, _Bounce, _Click, _Job, _Journey, _Open, _Sent, ent., ContactMaster
+
+### Dependency Checking
+
+Before deletion, checks for references in:
+- Query Activities (SQL text parsing)
+- Automations (Query, Import, Filter, Data Extract activities)
+- Journey Builder (entry events, decision splits)
+- Triggered Send Definitions
+
+### Automatic Backups
+
+Schema backups are saved to `backup/` before any deletion.
+
+### Resumable Operations
+
+If interrupted (Ctrl+C, error), resume with:
+
+```bash
+node src/scripts/delete-data-extensions.js --resume [operation-id]
+```
+
+---
 
 ## Debug Scripts
 
-Debug scripts for troubleshooting specific issues:
+For troubleshooting specific issues:
 
 ```bash
 # Test SOAP connectivity
 node src/scripts/debug-soap.js
 
-# Test dependency detection for a specific DE
-node src/scripts/debug-de-dependencies.js "DE CustomerKey"
+# Test dependency detection for a DE
+node src/scripts/debug-de-dependencies.js "DE_CustomerKey"
 
-# Test automation details
+# Inspect automation details
 node src/scripts/debug-automation.js "Automation Name"
 
-# Test filter activity details
+# Inspect filter activity
 node src/scripts/debug-filter.js "FilterId"
-
-# Test dependency classification
-node src/scripts/debug-dependency.js "DE_CustomerKey"
 ```
 
-## Restore Scripts
-
-Restore previously deleted items from backups:
+Enable debug logging:
 
 ```bash
-# Restore Data Extensions from backup
-node src/scripts/restore-data-extensions.js --backup-file "backup/de-schemas-20240101.json"
-
-# Restore Query Activities from backup
-node src/scripts/restore-queries.js --backup-file "backup/queries-20240101.json"
-
-# Update automation query references after restore
-node src/scripts/update-automation-queries.js --mapping-file "restore/query-mapping.json"
+LOG_LEVEL=debug node src/scripts/audit-folder.js --folder "Archive"
 ```
 
-## Analyze Dependencies
-
-Standalone dependency analysis without deletion:
-
-```bash
-# Analyze dependencies for DEs in a folder
-node src/scripts/analyze-dependencies.js --folder "Data Extensions/Archive"
-```
-
-## Caching
-
-The toolkit uses intelligent caching to minimize API calls:
-
-### Folder Cache
-- Cached locally for 24 hours
-- Auto-refreshes on first run
-- Force refresh with `--refresh-cache`
-
-### Bulk Data Cache
-- Stores automations, filters, queries, imports, journeys, data extracts
-- 24-hour expiry
-- Used for dependency analysis
-
-```bash
-# Check cache status
-node src/index.js sync --status
-
-# Clear cache
-node src/index.js sync --clear
-
-# Force refresh
-node src/index.js sync --refresh
-```
+---
 
 ## Output Directories
 
 | Directory | Contents |
 |-----------|----------|
-| `audit/` | JSON and CSV audit reports, dependency exports |
+| `audit/` | JSON and CSV audit reports |
 | `logs/` | Detailed operation logs |
 | `backup/` | DE schema backups before deletion |
-| `state/` | Operation state for resume capability |
-| `undo/` | Templates to recreate deleted DEs |
-| `cache/` | Cached folder structure and bulk data |
+| `state/` | Operation state for resume |
+| `cache/` | Cached folder and metadata |
+
+---
 
 ## Scheduled Execution
 
-For running via cron or CI/CD:
+For cron or CI/CD:
 
 ```bash
 node src/scripts/delete-data-extensions.js \
@@ -343,62 +333,9 @@ node src/scripts/delete-data-extensions.js \
   --webhook-url "https://hooks.slack.com/services/..."
 ```
 
-## Webhook Notifications
-
-Send operation results to Slack, Teams, or monitoring systems:
-
-```bash
-# Via command line
---webhook-url "https://hooks.slack.com/services/..."
-
-# Or via .env
-WEBHOOK_URL=https://hooks.slack.com/services/...
-```
-
-Webhook payload includes:
-- Operation type and ID
-- Business Unit
-- Target folder
-- Success/failure counts
-- Completion timestamp
-
-## Safety Features
-
-### Dry Run by Default
-All delete operations run in preview mode. Use `--confirm` for live execution.
-
-### Multi-Step Confirmation
-Live deletions require typing an exact phrase:
-```
-Type 'DELETE 15 DATA EXTENSIONS' to confirm:
-```
-
-### Dependency Checking
-Before deletion, checks for references in:
-- Automation Studio (Query, Import, Filter, Data Extract activities)
-- Journey Builder (entry events, decision splits)
-- Triggered Send Definitions
-- SQL Query text (SELECT/FROM/JOIN clauses)
-
-### Protected Items
-System items are automatically detected and:
-1. Listed in audit reports
-2. Blocked from deletion by default
-3. Can be skipped with `--skip-protected`
-
-### Interruption Recovery
-If interrupted (Ctrl+C, error):
-- State saved to `state/[operation-id].json`
-- Resume with `--resume [operation-id]`
+---
 
 ## Troubleshooting
-
-### Folder Path Issues
-
-If paths with spaces fail, run directly with node:
-```bash
-node src/scripts/audit-folder.js --folder "Data Extensions/My Folder (2023)"
-```
 
 ### Authentication Errors
 
@@ -413,33 +350,66 @@ node src/scripts/audit-folder.js --folder "Data Extensions/My Folder (2023)"
 `403 Forbidden` or `Insufficient privileges`:
 - Verify Installed Package has Data Extension Read/Write permissions
 - For automations, ensure Automation Read/Write access
-- For dependency checks, ensure Journey read access
+- For dependency checks, ensure Journey Read access
 
 ### Folder Not Found
 
 The toolkit suggests similar folders:
+
 ```
 Did you mean one of these?
   - Data Extensions/Archive/2023
   - Data Extensions/Archive/Campaigns
 ```
 
-### Debug Mode
+---
 
-Enable detailed logging:
-```bash
-LOG_LEVEL=debug node src/scripts/audit-folder.js --folder "Archive"
+## Project Structure
+
+```
+src/
+├── index.js              # CLI entry point (yargs)
+├── config/
+│   └── index.js          # Configuration and validation
+├── lib/
+│   ├── sfmc-auth.js      # OAuth 2.0 token management
+│   ├── sfmc-rest.js      # REST API client
+│   ├── sfmc-soap.js      # SOAP API client
+│   ├── folder-service.js # Folder hierarchy and caching
+│   ├── data-extension-service.js  # DE operations
+│   ├── dependency-analyzer.js     # Dependency detection
+│   ├── bulk-data-loader.js        # Metadata loading
+│   ├── cache.js          # File-based cache
+│   ├── logger.js         # Logging and audit trails
+│   └── utils.js          # Shared utilities
+└── scripts/
+    ├── audit-folder.js
+    ├── analyze-bu.js
+    ├── delete-data-extensions.js
+    ├── delete-folders.js
+    ├── delete-automations.js
+    ├── audit-cloudpages.js
+    └── debug-*.js        # Debug utilities
 ```
 
-## API Rate Limits
+---
 
-The toolkit respects SFMC rate limits:
-- Default 200ms delay between API calls
-- Automatic retry with exponential backoff
-- Folder caching to minimize calls
-- Bulk data loading with 24-hour cache
-- Configurable batch sizes
+## Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| axios | HTTP requests |
+| xml2js | XML parsing |
+| winston | Logging |
+| yargs | CLI parsing |
+| chalk | Terminal colors |
+| ora | Spinners |
+| inquirer | Interactive prompts |
+| dayjs | Date handling |
+| dotenv | Environment config |
+
+---
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) file for details.
+MIT License - See [LICENSE](LICENSE) for details.

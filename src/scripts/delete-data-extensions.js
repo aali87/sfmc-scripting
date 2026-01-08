@@ -24,7 +24,7 @@ import dayjs from 'dayjs';
 import config, { validateConfig, isDeProtected } from '../config/index.js';
 import { createLogger, createAuditLogger, createStateManager } from '../lib/logger.js';
 import { testConnection } from '../lib/sfmc-auth.js';
-import { getFolderByPath, getFolderByName, getSubfolders, findSimilarFolders, clearFolderCache } from '../lib/folder-service.js';
+import { getFolderByPath, getFolderByName, getSubfolders, findSimilarFolders, clearFolderCache, findFolder } from '../lib/folder-service.js';
 import {
   getDataExtensionsInFolder,
   getFullDataExtensionDetails,
@@ -50,6 +50,7 @@ import {
   getAutomationWithMetadata
 } from '../lib/sfmc-rest.js';
 import { deleteQueryActivity } from '../lib/sfmc-soap.js';
+import { sleep, formatNumber, escapeCSV } from '../lib/utils.js';
 
 // Parse command line arguments
 const argv = yargs(hideBin(process.argv))
@@ -173,25 +174,10 @@ const logger = createLogger('delete-data-extensions');
 const auditLogger = createAuditLogger('delete-des');
 
 /**
- * Format number with commas
- */
-function formatNumber(num) {
-  if (num === null || num === undefined) return 'N/A';
-  return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-}
-
-/**
- * Sleep helper
- */
-async function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/**
  * Print deletion preview
  */
 function printPreview(dataExtensions, summary, backupDir, filtersToDelete = [], automationsToDelete = [], queriesToDelete = []) {
-  const width = 70;
+  const width = config.ui.consoleWidth;
   const line = '─'.repeat(width);
 
   console.log('');
@@ -223,14 +209,14 @@ function printPreview(dataExtensions, summary, backupDir, filtersToDelete = [], 
   console.log(chalk.yellow(`├${line}┤`));
   console.log(chalk.yellow(`│`) + ' Data Extensions:'.padEnd(width) + chalk.yellow(`│`));
 
-  dataExtensions.slice(0, 20).forEach((de, i) => {
+  dataExtensions.slice(0, config.ui.maxItemsToDisplay).forEach((de, i) => {
     const rowInfo = de.rowCount !== null ? ` (${formatNumber(de.rowCount)} rows)` : '';
     const lineText = `   ${i + 1}. ${de.name}${rowInfo}`;
     console.log(chalk.yellow(`│`) + lineText.substring(0, width).padEnd(width) + chalk.yellow(`│`));
   });
 
-  if (dataExtensions.length > 20) {
-    console.log(chalk.yellow(`│`) + `   ... and ${dataExtensions.length - 20} more`.padEnd(width) + chalk.yellow(`│`));
+  if (dataExtensions.length > config.ui.maxItemsToDisplay) {
+    console.log(chalk.yellow(`│`) + `   ... and ${dataExtensions.length - config.ui.maxItemsToDisplay} more`.padEnd(width) + chalk.yellow(`│`));
   }
 
   // Show filters if any
@@ -374,16 +360,6 @@ async function exportDependenciesToCsv(desWithDeps, targetFolder, logger = null)
   } catch (e) {
     if (logger) logger.debug(`Could not load automations for CSV: ${e.message}`);
   }
-
-  // Escape CSV values (wrap in quotes if contains comma or quote)
-  const escapeCSV = (val) => {
-    if (val === null || val === undefined) return '';
-    const str = String(val);
-    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
-      return `"${str.replace(/"/g, '""')}"`;
-    }
-    return str;
-  };
 
   // Cache for automation metadata to avoid repeated API calls
   const automationMetadataCache = new Map();
@@ -767,7 +743,7 @@ async function handleDependenciesInteractively(desWithDeps, logger, autoDeleteFi
  * Print final report
  */
 function printReport(results, auditPath, backupDir, undoPath) {
-  const width = 70;
+  const width = config.ui.consoleWidth;
   const line = '─'.repeat(width);
 
   console.log('');
@@ -829,6 +805,213 @@ function printReport(results, auditPath, backupDir, undoPath) {
 }
 
 /**
+ * Execute deletion of filter activities
+ * @param {Array} filtersToDelete - Filters to delete
+ * @param {object} results - Results object to update
+ * @param {object} auditLogger - Audit logger instance
+ * @param {object} logger - Logger instance
+ */
+async function executeFilterDeletions(filtersToDelete, results, auditLogger, logger) {
+  if (filtersToDelete.length === 0) return;
+
+  console.log(chalk.cyan(`\nDeleting ${filtersToDelete.length} standalone filter activity(s)...`));
+
+  for (const filter of filtersToDelete) {
+    console.log(chalk.gray(`  Deleting filter: ${filter.name}...`));
+
+    try {
+      const filterResult = await deleteFilterActivity(filter.id, logger);
+
+      if (filterResult.success) {
+        console.log(chalk.green(`    ✓ Filter deleted`));
+        results.filtersDeleted++;
+        auditLogger.addSuccess({
+          type: 'FilterActivity',
+          id: filter.id,
+          name: filter.name
+        });
+      } else {
+        console.log(chalk.yellow(`    ⚠ Filter deletion failed: ${filterResult.error}`));
+        results.filtersFailed++;
+        logger.warn(`Filter deletion failed for ${filter.name}: ${filterResult.error}`);
+      }
+    } catch (error) {
+      console.log(chalk.yellow(`    ⚠ Filter deletion error: ${error.message}`));
+      results.filtersFailed++;
+      logger.warn(`Filter deletion error for ${filter.name}: ${error.message}`);
+    }
+
+    await sleep(config.safety.apiRateLimitDelayMs);
+  }
+
+  console.log('');
+}
+
+/**
+ * Execute deletion of stale automations
+ * @param {Array} automationsToDelete - Automations to delete
+ * @param {object} results - Results object to update
+ * @param {object} auditLogger - Audit logger instance
+ * @param {object} logger - Logger instance
+ */
+async function executeAutomationDeletions(automationsToDelete, results, auditLogger, logger) {
+  if (automationsToDelete.length === 0) return;
+
+  console.log(chalk.cyan(`Deleting ${automationsToDelete.length} stale automation(s)...`));
+
+  for (const auto of automationsToDelete) {
+    console.log(chalk.gray(`  Deleting automation: ${auto.name} (${auto.reason})...`));
+
+    try {
+      const autoResult = await deleteAutomation(auto.id, logger);
+
+      if (autoResult.success) {
+        console.log(chalk.green(`    ✓ Automation deleted`));
+        results.automationsDeleted++;
+        auditLogger.addSuccess({
+          type: 'Automation',
+          id: auto.id,
+          name: auto.name,
+          reason: auto.reason
+        });
+      } else {
+        console.log(chalk.yellow(`    ⚠ Automation deletion failed: ${autoResult.error}`));
+        results.automationsFailed++;
+        logger.warn(`Automation deletion failed for ${auto.name}: ${autoResult.error}`);
+      }
+    } catch (error) {
+      console.log(chalk.yellow(`    ⚠ Automation deletion error: ${error.message}`));
+      results.automationsFailed++;
+      logger.warn(`Automation deletion error for ${auto.name}: ${error.message}`);
+    }
+
+    await sleep(config.safety.apiRateLimitDelayMs);
+  }
+
+  console.log('');
+}
+
+/**
+ * Execute deletion of query activities
+ * @param {Array} queriesToDelete - Queries to delete
+ * @param {object} results - Results object to update
+ * @param {object} auditLogger - Audit logger instance
+ * @param {object} logger - Logger instance
+ */
+async function executeQueryDeletions(queriesToDelete, results, auditLogger, logger) {
+  if (queriesToDelete.length === 0) return;
+
+  console.log(chalk.cyan(`Deleting ${queriesToDelete.length} query activity(s)...`));
+
+  for (const query of queriesToDelete) {
+    console.log(chalk.gray(`  Deleting query: ${query.name}...`));
+
+    try {
+      const queryResult = await deleteQueryActivity(query.id, logger);
+
+      if (queryResult.success) {
+        console.log(chalk.green(`    ✓ Query deleted`));
+        results.queriesDeleted++;
+        auditLogger.addSuccess({
+          type: 'QueryActivity',
+          id: query.id,
+          name: query.name
+        });
+      } else {
+        const errorMsg = queryResult.results?.[0]?.statusMessage || 'Unknown error';
+        console.log(chalk.yellow(`    ⚠ Query deletion failed: ${errorMsg}`));
+        results.queriesFailed++;
+        logger.warn(`Query deletion failed for ${query.name}: ${errorMsg}`);
+        auditLogger.addFailure({
+          type: 'QueryActivity',
+          id: query.id,
+          name: query.name
+        }, errorMsg);
+      }
+    } catch (error) {
+      console.log(chalk.yellow(`    ⚠ Query deletion error: ${error.message}`));
+      results.queriesFailed++;
+      logger.warn(`Query deletion error for ${query.name}: ${error.message}`);
+      auditLogger.addFailure({
+        type: 'QueryActivity',
+        id: query.id,
+        name: query.name
+      }, error.message);
+    }
+
+    await sleep(config.safety.apiRateLimitDelayMs);
+  }
+
+  console.log('');
+}
+
+/**
+ * Execute deletion of data extensions
+ * @param {Array} desToDelete - Data extensions to delete
+ * @param {object} results - Results object to update
+ * @param {object} auditLogger - Audit logger instance
+ * @param {object} logger - Logger instance
+ * @param {object} stateManager - State manager for saving progress
+ * @param {object} targetFolder - Target folder info
+ * @param {number} batchSize - Batch size for progress logging
+ */
+async function executeDataExtensionDeletions(desToDelete, results, auditLogger, logger, stateManager, targetFolder, batchSize) {
+  console.log(chalk.bold('Deleting Data Extensions...'));
+
+  let batch = 0;
+
+  for (let i = 0; i < desToDelete.length; i++) {
+    const de = desToDelete[i];
+
+    console.log(chalk.gray(`[${i + 1}/${desToDelete.length}] Deleting ${de.name}...`));
+
+    try {
+      const result = await deleteDataExtension(de.customerKey, logger);
+
+      if (result.success) {
+        console.log(chalk.green(`  ✓ Deleted`));
+        results.successful++;
+        auditLogger.addSuccess({
+          customerKey: de.customerKey,
+          name: de.name,
+          rowCount: de.rowCount
+        });
+      } else {
+        console.log(chalk.red(`  ✗ Failed: ${result.error}`));
+        results.failed++;
+        results.failedItems.push({ name: de.name, error: result.error });
+        auditLogger.addFailure({
+          customerKey: de.customerKey,
+          name: de.name
+        }, result.error);
+      }
+    } catch (error) {
+      console.log(chalk.red(`  ✗ Error: ${error.message}`));
+      results.failed++;
+      results.failedItems.push({ name: de.name, error: error.message });
+      auditLogger.addFailure({
+        customerKey: de.customerKey,
+        name: de.name
+      }, error.message);
+    }
+
+    await sleep(config.safety.apiRateLimitDelayMs);
+
+    // Batch progress
+    if ((i + 1) % batchSize === 0 && i + 1 < desToDelete.length) {
+      batch++;
+      console.log(chalk.cyan(`\n--- Batch ${batch} complete (${i + 1}/${desToDelete.length}) ---\n`));
+
+      stateManager.save({
+        targetFolder: targetFolder.path,
+        processed: auditLogger.getData().results,
+        remaining: desToDelete.slice(i + 1).map(de => de.customerKey)
+      });
+    }
+  }
+}
+
+/**
  * Main deletion function
  */
 async function runDeletion() {
@@ -851,12 +1034,16 @@ async function runDeletion() {
     console.log(chalk.yellow('\n\nInterrupted! Saving state...'));
 
     if (stateManager) {
-      stateManager.save({
-        targetFolder: targetFolder?.path,
-        processed: auditLogger.getData().results,
-        remaining: desToDelete.map(de => de.customerKey)
-      });
-      console.log(chalk.yellow(`State saved. Resume with: --resume ${auditLogger.operationId}`));
+      try {
+        stateManager.save({
+          targetFolder: targetFolder?.path,
+          processed: auditLogger.getData().results,
+          remaining: desToDelete.map(de => de.customerKey)
+        });
+        console.log(chalk.yellow(`State saved. Resume with: --resume ${auditLogger.operationId}`));
+      } catch (error) {
+        console.error(chalk.red('Warning: Failed to save state:'), error.message);
+      }
     }
 
     process.exit(2);
@@ -901,7 +1088,13 @@ async function runDeletion() {
 
     // Test connection
     const spinner = ora('Connecting to SFMC...').start();
-    const connectionResult = await testConnection(logger);
+    let connectionResult;
+    try {
+      connectionResult = await testConnection(logger);
+    } catch (error) {
+      spinner.fail('Connection failed');
+      throw error;
+    }
 
     if (!connectionResult.success) {
       spinner.fail('Connection failed');
@@ -914,16 +1107,22 @@ async function runDeletion() {
     // Handle cache refresh if requested
     if (argv.refreshCache) {
       spinner.start('Clearing cache and fetching fresh data from SFMC...');
-      await clearFolderCache(logger);
-      spinner.succeed('Cache cleared - will fetch fresh data');
+      try {
+        await clearFolderCache(logger);
+        spinner.succeed('Cache cleared - will fetch fresh data');
+      } catch (error) {
+        spinner.fail('Failed to clear cache');
+        throw error;
+      }
     }
 
     // Find target folder
     spinner.start('Finding target folder...');
-    targetFolder = await getFolderByPath(argv.folder, logger);
-
-    if (!targetFolder) {
-      targetFolder = await getFolderByName(argv.folder, logger);
+    try {
+      targetFolder = await findFolder(argv.folder, logger);
+    } catch (error) {
+      spinner.fail('Failed to find folder');
+      throw error;
     }
 
     if (!targetFolder) {
@@ -952,22 +1151,32 @@ async function runDeletion() {
 
     // Get subfolders
     spinner.start('Discovering subfolders...');
-    const subfolders = await getSubfolders(targetFolder.id, true, logger);
+    let subfolders;
+    try {
+      subfolders = await getSubfolders(targetFolder.id, true, logger);
+    } catch (error) {
+      spinner.fail('Failed to discover subfolders');
+      throw error;
+    }
     const allFolders = [targetFolder, ...subfolders];
     spinner.succeed(`Found ${allFolders.length} folder(s)`);
 
     // Get all data extensions
     spinner.start('Discovering Data Extensions...');
 
-    for (const folder of allFolders) {
-      const des = await getDataExtensionsInFolder(folder.id, logger);
-      des.forEach(de => {
-        de.folderPath = folder.path;
-      });
-      allDataExtensions.push(...des);
+    try {
+      for (const folder of allFolders) {
+        const des = await getDataExtensionsInFolder(folder.id, logger);
+        des.forEach(de => {
+          de.folderPath = folder.path;
+        });
+        allDataExtensions.push(...des);
+      }
+      spinner.succeed(`Found ${allDataExtensions.length} Data Extension(s)`);
+    } catch (error) {
+      spinner.fail('Failed to discover Data Extensions');
+      throw error;
     }
-
-    spinner.succeed(`Found ${allDataExtensions.length} Data Extension(s)`);
 
     if (allDataExtensions.length === 0) {
       console.log(chalk.green('\nNo Data Extensions found in the specified folder(s).'));
@@ -980,18 +1189,28 @@ async function runDeletion() {
     // Date filters
     if (argv.olderThanDays) {
       spinner.start(`Applying date filter (older than ${argv.olderThanDays} days)...`);
-      filteredDes = filterByDate(filteredDes, { olderThanDays: argv.olderThanDays });
-      spinner.succeed(`After date filter: ${filteredDes.length} DE(s)`);
+      try {
+        filteredDes = filterByDate(filteredDes, { olderThanDays: argv.olderThanDays });
+        spinner.succeed(`After date filter: ${filteredDes.length} DE(s)`);
+      } catch (error) {
+        spinner.fail('Failed to apply date filter');
+        throw error;
+      }
     }
 
     // Pattern filters
     if (argv.excludePattern || argv.includePattern) {
       spinner.start('Applying pattern filters...');
-      filteredDes = filterByPattern(filteredDes, {
-        exclude: argv.excludePattern,
-        include: argv.includePattern
-      });
-      spinner.succeed(`After pattern filter: ${filteredDes.length} DE(s)`);
+      try {
+        filteredDes = filterByPattern(filteredDes, {
+          exclude: argv.excludePattern,
+          include: argv.includePattern
+        });
+        spinner.succeed(`After pattern filter: ${filteredDes.length} DE(s)`);
+      } catch (error) {
+        spinner.fail('Failed to apply pattern filter');
+        throw error;
+      }
     }
 
     if (filteredDes.length === 0) {
@@ -1002,17 +1221,22 @@ async function runDeletion() {
     // Get detailed info for each DE
     spinner.start('Gathering Data Extension details...');
 
-    for (let i = 0; i < filteredDes.length; i++) {
-      const de = filteredDes[i];
-      spinner.text = `Gathering details: ${i + 1}/${filteredDes.length} - ${de.name}`;
+    try {
+      for (let i = 0; i < filteredDes.length; i++) {
+        const de = filteredDes[i];
+        spinner.text = `Gathering details: ${i + 1}/${filteredDes.length} - ${de.name}`;
 
-      const details = await getFullDataExtensionDetails(de.customerKey, true, logger);
-      if (details) {
-        Object.assign(de, details);
+        const details = await getFullDataExtensionDetails(de.customerKey, true, logger);
+        if (details) {
+          Object.assign(de, details);
+        }
       }
-    }
 
-    spinner.succeed('Data Extension details gathered');
+      spinner.succeed('Data Extension details gathered');
+    } catch (error) {
+      spinner.fail('Failed to gather Data Extension details');
+      throw error;
+    }
 
     // Check protection
     const protectedDes = filteredDes.filter(de => de.isProtected);
@@ -1043,40 +1267,45 @@ async function runDeletion() {
     if (!argv.skipDependencyCheck && filteredDes.length > 0) {
       spinner.start('Running smart dependency analysis...');
 
-      // Prepare DE objects for analysis
-      const desForAnalysis = filteredDes.map(de => ({
-        customerKey: de.customerKey,
-        objectId: de.objectId,
-        name: de.name
-      }));
+      try {
+        // Prepare DE objects for analysis
+        const desForAnalysis = filteredDes.map(de => ({
+          customerKey: de.customerKey,
+          objectId: de.objectId,
+          name: de.name
+        }));
 
-      dependencyReport = await analyzeDependencies(desForAnalysis, {
-        logger,
-        onProgress: (stage, current, total, message) => {
-          spinner.text = message;
-        }
-      });
-
-      // Merge dependency info into DE objects
-      for (const de of filteredDes) {
-        const deDeps = dependencyReport.deMapping?.get(de.customerKey) || [];
-        de.hasDependencies = deDeps.length > 0;
-        de.dependencyCount = deDeps.length;
-        de.dependencies = deDeps.map(ref => {
-          const fullDep = dependencyReport.all.find(d => d.type === ref.type && d.id === ref.id);
-          return fullDep || ref;
+        dependencyReport = await analyzeDependencies(desForAnalysis, {
+          logger,
+          onProgress: (stage, current, total, message) => {
+            spinner.text = message;
+          }
         });
 
-        // Count safe vs blocking
-        de.safeToDeleteDeps = de.dependencies.filter(d =>
-          d.classification === DependencyClassification.SAFE_TO_DELETE
-        ).length;
-        de.blockingDeps = de.dependencies.filter(d =>
-          d.classification !== DependencyClassification.SAFE_TO_DELETE
-        ).length;
-      }
+        // Merge dependency info into DE objects
+        for (const de of filteredDes) {
+          const deDeps = dependencyReport.deMapping?.get(de.customerKey) || [];
+          de.hasDependencies = deDeps.length > 0;
+          de.dependencyCount = deDeps.length;
+          de.dependencies = deDeps.map(ref => {
+            const fullDep = dependencyReport.all.find(d => d.type === ref.type && d.id === ref.id);
+            return fullDep || ref;
+          });
 
-      spinner.succeed(`Smart analysis complete: ${dependencyReport.summary.safeToDelete} safe, ${dependencyReport.summary.requiresReview} require review`);
+          // Count safe vs blocking
+          de.safeToDeleteDeps = de.dependencies.filter(d =>
+            d.classification === DependencyClassification.SAFE_TO_DELETE
+          ).length;
+          de.blockingDeps = de.dependencies.filter(d =>
+            d.classification !== DependencyClassification.SAFE_TO_DELETE
+          ).length;
+        }
+
+        spinner.succeed(`Smart analysis complete: ${dependencyReport.summary.safeToDelete} safe, ${dependencyReport.summary.requiresReview} require review`);
+      } catch (error) {
+        spinner.fail('Dependency analysis failed');
+        throw error;
+      }
 
       // Print the smart analysis report
       console.log(formatAnalysisReport(dependencyReport));
@@ -1256,18 +1485,23 @@ async function runDeletion() {
 
       spinner.start('Backing up DE schemas...');
 
-      for (let i = 0; i < desToDelete.length; i++) {
-        const de = desToDelete[i];
-        spinner.text = `Backing up schemas: ${i + 1}/${desToDelete.length}`;
+      try {
+        for (let i = 0; i < desToDelete.length; i++) {
+          const de = desToDelete[i];
+          spinner.text = `Backing up schemas: ${i + 1}/${desToDelete.length}`;
 
-        try {
-          await backupDataExtensionSchema(de.customerKey, backupDir, logger);
-        } catch (err) {
-          logger.warn(`Failed to backup ${de.name}: ${err.message}`);
+          try {
+            await backupDataExtensionSchema(de.customerKey, backupDir, logger);
+          } catch (err) {
+            logger.warn(`Failed to backup ${de.name}: ${err.message}`);
+          }
         }
-      }
 
-      spinner.succeed(`Schemas backed up to ${backupDir}`);
+        spinner.succeed(`Schemas backed up to ${backupDir}`);
+      } catch (error) {
+        spinner.fail('Failed to backup schemas');
+        throw error;
+      }
     }
 
     // Calculate summary
@@ -1333,187 +1567,22 @@ async function runDeletion() {
       queriesFailed: 0
     };
 
-    // Delete filter activities first (before their DEs)
-    if (filtersToDelete.length > 0) {
-      console.log(chalk.cyan(`\nDeleting ${filtersToDelete.length} standalone filter activity(s)...`));
-
-      for (const filter of filtersToDelete) {
-        console.log(chalk.gray(`  Deleting filter: ${filter.name}...`));
-
-        try {
-          const filterResult = await deleteFilterActivity(filter.id, logger);
-
-          if (filterResult.success) {
-            console.log(chalk.green(`    ✓ Filter deleted`));
-            results.filtersDeleted++;
-            auditLogger.addSuccess({
-              type: 'FilterActivity',
-              id: filter.id,
-              name: filter.name
-            });
-          } else {
-            console.log(chalk.yellow(`    ⚠ Filter deletion failed: ${filterResult.error}`));
-            results.filtersFailed++;
-            // Don't add to failedItems - filter failure shouldn't block DE deletion
-            logger.warn(`Filter deletion failed for ${filter.name}: ${filterResult.error}`);
-          }
-        } catch (error) {
-          console.log(chalk.yellow(`    ⚠ Filter deletion error: ${error.message}`));
-          results.filtersFailed++;
-          logger.warn(`Filter deletion error for ${filter.name}: ${error.message}`);
-        }
-
-        await sleep(config.safety.apiRateLimitDelayMs);
-      }
-
-      console.log('');
-    }
-
-    // Delete stale automations (before their DEs)
-    if (automationsToDelete.length > 0) {
-      console.log(chalk.cyan(`Deleting ${automationsToDelete.length} stale automation(s)...`));
-
-      for (const auto of automationsToDelete) {
-        console.log(chalk.gray(`  Deleting automation: ${auto.name} (${auto.reason})...`));
-
-        try {
-          const autoResult = await deleteAutomation(auto.id, logger);
-
-          if (autoResult.success) {
-            console.log(chalk.green(`    ✓ Automation deleted`));
-            results.automationsDeleted++;
-            auditLogger.addSuccess({
-              type: 'Automation',
-              id: auto.id,
-              name: auto.name,
-              reason: auto.reason
-            });
-          } else {
-            console.log(chalk.yellow(`    ⚠ Automation deletion failed: ${autoResult.error}`));
-            results.automationsFailed++;
-            logger.warn(`Automation deletion failed for ${auto.name}: ${autoResult.error}`);
-          }
-        } catch (error) {
-          console.log(chalk.yellow(`    ⚠ Automation deletion error: ${error.message}`));
-          results.automationsFailed++;
-          logger.warn(`Automation deletion error for ${auto.name}: ${error.message}`);
-        }
-
-        await sleep(config.safety.apiRateLimitDelayMs);
-      }
-
-      console.log('');
-    }
-
-    // Delete query activities (before their DEs)
-    if (queriesToDelete.length > 0) {
-      console.log(chalk.cyan(`Deleting ${queriesToDelete.length} query activity(s)...`));
-
-      for (const query of queriesToDelete) {
-        console.log(chalk.gray(`  Deleting query: ${query.name}...`));
-
-        try {
-          const queryResult = await deleteQueryActivity(query.id, logger);
-
-          if (queryResult.success) {
-            console.log(chalk.green(`    ✓ Query deleted`));
-            results.queriesDeleted++;
-            auditLogger.addSuccess({
-              type: 'QueryActivity',
-              id: query.id,
-              name: query.name
-            });
-          } else {
-            const errorMsg = queryResult.results?.[0]?.statusMessage || 'Unknown error';
-            console.log(chalk.yellow(`    ⚠ Query deletion failed: ${errorMsg}`));
-            results.queriesFailed++;
-            logger.warn(`Query deletion failed for ${query.name}: ${errorMsg}`);
-            auditLogger.addFailure({
-              type: 'QueryActivity',
-              id: query.id,
-              name: query.name
-            }, errorMsg);
-          }
-        } catch (error) {
-          console.log(chalk.yellow(`    ⚠ Query deletion error: ${error.message}`));
-          results.queriesFailed++;
-          logger.warn(`Query deletion error for ${query.name}: ${error.message}`);
-          auditLogger.addFailure({
-            type: 'QueryActivity',
-            id: query.id,
-            name: query.name
-          }, error.message);
-        }
-
-        await sleep(config.safety.apiRateLimitDelayMs);
-      }
-
-      console.log('');
-    }
-
-    console.log(chalk.bold('Deleting Data Extensions...'));
-
-    const batchSize = argv.batchSize;
-    let batch = 0;
-
-    for (let i = 0; i < desToDelete.length; i++) {
-      const de = desToDelete[i];
-
-      // Progress
-      console.log(chalk.gray(`[${i + 1}/${desToDelete.length}] Deleting ${de.name}...`));
-
-      try {
-        const result = await deleteDataExtension(de.customerKey, logger);
-
-        if (result.success) {
-          console.log(chalk.green(`  ✓ Deleted`));
-          results.successful++;
-          auditLogger.addSuccess({
-            customerKey: de.customerKey,
-            name: de.name,
-            rowCount: de.rowCount
-          });
-        } else {
-          console.log(chalk.red(`  ✗ Failed: ${result.error}`));
-          results.failed++;
-          results.failedItems.push({ name: de.name, error: result.error });
-          auditLogger.addFailure({
-            customerKey: de.customerKey,
-            name: de.name
-          }, result.error);
-        }
-      } catch (error) {
-        console.log(chalk.red(`  ✗ Error: ${error.message}`));
-        results.failed++;
-        results.failedItems.push({ name: de.name, error: error.message });
-        auditLogger.addFailure({
-          customerKey: de.customerKey,
-          name: de.name
-        }, error.message);
-      }
-
-      // Rate limiting
-      await sleep(config.safety.apiRateLimitDelayMs);
-
-      // Batch progress
-      if ((i + 1) % batchSize === 0 && i + 1 < desToDelete.length) {
-        batch++;
-        console.log(chalk.cyan(`\n--- Batch ${batch} complete (${i + 1}/${desToDelete.length}) ---\n`));
-
-        // Save state after each batch
-        stateManager.save({
-          targetFolder: targetFolder.path,
-          processed: auditLogger.getData().results,
-          remaining: desToDelete.slice(i + 1).map(de => de.customerKey)
-        });
-      }
-    }
-
-    // Generate undo script
+    // Generate undo script BEFORE any deletions (for recovery if process is interrupted)
     let undoPath = null;
-    if (results.successful > 0) {
+    if (desToDelete.length > 0) {
       undoPath = generateUndoScript(desToDelete, config.paths.undo);
+      console.log(chalk.cyan(`Undo script saved to: ${undoPath}`));
+      console.log(chalk.gray('  (Use this script to recreate DE schemas if needed)'));
+      console.log('');
     }
+
+    // Delete dependencies first (before their DEs)
+    await executeFilterDeletions(filtersToDelete, results, auditLogger, logger);
+    await executeAutomationDeletions(automationsToDelete, results, auditLogger, logger);
+    await executeQueryDeletions(queriesToDelete, results, auditLogger, logger);
+
+    // Delete data extensions
+    await executeDataExtensionDeletions(desToDelete, results, auditLogger, logger, stateManager, targetFolder, argv.batchSize);
 
     // Determine exit code
     let exitCode = 0;

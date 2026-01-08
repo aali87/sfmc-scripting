@@ -44,6 +44,11 @@ function runScript(scriptName, args) {
     shell: true
   });
 
+  child.on('error', (error) => {
+    console.error(chalk.red(`Failed to start script '${scriptName}': ${error.message}`));
+    process.exit(1);
+  });
+
   child.on('close', (code) => {
     process.exit(code);
   });
@@ -341,6 +346,175 @@ const cli = yargs(hideBin(process.argv))
         console.log(`  Error: ${error.message}`);
         process.exit(1);
       }
+    }
+  )
+
+  // Analyze BU command
+  .command(
+    'analyze-bu',
+    'Analyze all DEs in a Business Unit with deletion recommendations',
+    (yargs) => {
+      return yargs
+        .option('business-unit', {
+          alias: 'bu',
+          describe: 'Business Unit MID to analyze',
+          type: 'string',
+          demandOption: true
+        })
+        .option('stale-years', {
+          describe: 'Years of inactivity threshold',
+          type: 'number',
+          default: 3
+        })
+        .option('output', {
+          alias: 'o',
+          describe: 'Output CSV file path',
+          type: 'string'
+        })
+        .option('refresh-cache', {
+          describe: 'Force refresh cached data',
+          type: 'boolean',
+          default: false
+        })
+        .option('verbose', {
+          alias: 'v',
+          describe: 'Verbose output',
+          type: 'boolean',
+          default: false
+        })
+        .option('limit', {
+          describe: 'Limit DEs to analyze (for testing)',
+          type: 'number'
+        })
+        .example('$0 analyze-bu --bu 123456', 'Analyze Business Unit 123456')
+        .example('$0 analyze-bu --bu 123456 -o report.csv', 'Save to CSV')
+        .example('$0 analyze-bu --bu 123456 --stale-years 2', 'Custom inactivity threshold');
+    },
+    (argv) => {
+      const args = ['--business-unit', argv.businessUnit];
+      if (argv.staleYears) args.push('--stale-years', argv.staleYears);
+      if (argv.output) args.push('--output', argv.output);
+      if (argv.refreshCache) args.push('--refresh-cache');
+      if (argv.verbose) args.push('--verbose');
+      if (argv.limit) args.push('--limit', argv.limit);
+      runScript('analyze-bu', args);
+    }
+  )
+
+  // Audit CloudPages command
+  .command(
+    'audit-cloudpages',
+    'Audit CloudPages for scripts and patterns',
+    (yargs) => {
+      return yargs
+        .option('business-unit', {
+          alias: 'bu',
+          describe: 'Business Unit MID',
+          type: 'string',
+          demandOption: true
+        })
+        .option('search', {
+          alias: 's',
+          describe: 'Comma-separated patterns to search for',
+          type: 'string'
+        })
+        .option('output', {
+          alias: 'o',
+          describe: 'Output CSV file path',
+          type: 'string'
+        })
+        .option('include-content', {
+          describe: 'Include full HTML content in output',
+          type: 'boolean',
+          default: false
+        })
+        .option('published-only', {
+          describe: 'Only show published CloudPages',
+          type: 'boolean',
+          default: false
+        })
+        .option('with-matches-only', {
+          describe: 'Only show CloudPages with pattern matches',
+          type: 'boolean',
+          default: false
+        })
+        .option('verbose', {
+          alias: 'v',
+          describe: 'Verbose output',
+          type: 'boolean',
+          default: false
+        })
+        .option('limit', {
+          describe: 'Limit pages to analyze (for testing)',
+          type: 'number'
+        })
+        .example('$0 audit-cloudpages --bu 123456', 'Audit all CloudPages')
+        .example('$0 audit-cloudpages --bu 123456 -o report.csv', 'Export to CSV')
+        .example('$0 audit-cloudpages --bu 123456 -s "HTTPGet,WSProxy"', 'Search for specific patterns');
+    },
+    (argv) => {
+      const args = ['--business-unit', argv.businessUnit];
+      if (argv.search) args.push('--search', argv.search);
+      if (argv.output) args.push('--output', argv.output);
+      if (argv.includeContent) args.push('--include-content');
+      if (argv.publishedOnly) args.push('--published-only');
+      if (argv.withMatchesOnly) args.push('--with-matches-only');
+      if (argv.verbose) args.push('--verbose');
+      if (argv.limit) args.push('--limit', argv.limit);
+      runScript('audit-cloudpages', args);
+    }
+  )
+
+  // Update automation command
+  .command(
+    'update-automation',
+    'Update automation file transfer and import steps',
+    (yargs) => {
+      return yargs
+        .option('automation', {
+          alias: 'a',
+          describe: 'Name of the automation to update',
+          type: 'string',
+          demandOption: true
+        })
+        .option('business-unit', {
+          alias: 'bu',
+          describe: 'Business Unit MID',
+          type: 'string',
+          demandOption: true
+        })
+        .option('filename', {
+          alias: 'f',
+          describe: 'New filename for the file transfer step',
+          type: 'string'
+        })
+        .option('target-de', {
+          alias: 't',
+          describe: 'Target Data Extension name for the import step',
+          type: 'string'
+        })
+        .option('confirm', {
+          describe: 'Enable actual updates (default is dry-run)',
+          type: 'boolean',
+          default: false
+        })
+        .option('run', {
+          alias: 'r',
+          describe: 'Trigger the automation after updating',
+          type: 'boolean',
+          default: false
+        })
+        .example('$0 update-automation -a "Daily Import" --bu 123456 -f "data.csv"', 'Preview filename change')
+        .example('$0 update-automation -a "Daily Import" --bu 123456 -t "Staging_DE"', 'Preview target DE change')
+        .example('$0 update-automation -a "Daily Import" --bu 123456 -f "data.csv" -t "Staging_DE" --confirm --run', 'Apply changes and run');
+    },
+    (argv) => {
+      const args = ['--automation', argv.automation, '--business-unit', argv.businessUnit];
+      if (argv.filename) args.push('--filename', argv.filename);
+      if (argv.targetDe) args.push('--target-de', argv.targetDe);
+      if (argv.confirm) args.push('--confirm');
+      if (argv.run) args.push('--run');
+      runScript('update-automation', args);
     }
   )
 

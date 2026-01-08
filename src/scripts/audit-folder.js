@@ -21,9 +21,9 @@ import path from 'path';
 import dayjs from 'dayjs';
 
 import config, { validateConfig, isFolderProtected, isDeProtected } from '../config/index.js';
-import { createLogger, createAuditLogger } from '../lib/logger.js';
+import { createLogger } from '../lib/logger.js';
 import { testConnection } from '../lib/sfmc-auth.js';
-import { getFolderByPath, getFolderByName, getSubfolders, getFolderTree, findSimilarFolders, clearFolderCache } from '../lib/folder-service.js';
+import { getSubfolders, getFolderTree, findSimilarFolders, clearFolderCache, findFolder } from '../lib/folder-service.js';
 import { getDataExtensionsInFolder, getFullDataExtensionDetails } from '../lib/data-extension-service.js';
 import {
   analyzeDependencies,
@@ -32,6 +32,7 @@ import {
   exportDeDependenciesToCsv,
   DependencyClassification
 } from '../lib/dependency-analyzer.js';
+import { formatNumber } from '../lib/utils.js';
 
 // Parse command line arguments
 const argv = yargs(hideBin(process.argv))
@@ -80,18 +81,10 @@ const argv = yargs(hideBin(process.argv))
 const logger = createLogger('audit-folder');
 
 /**
- * Format number with commas
- */
-function formatNumber(num) {
-  if (num === null || num === undefined) return 'N/A';
-  return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-}
-
-/**
  * Print header box
  */
 function printHeader(folder) {
-  const width = 70;
+  const width = config.ui.consoleWidth;
   const line = '═'.repeat(width);
 
   console.log('');
@@ -363,7 +356,13 @@ async function runAudit() {
 
     // Test connection
     const spinner = ora('Connecting to SFMC...').start();
-    const connectionResult = await testConnection(logger);
+    let connectionResult;
+    try {
+      connectionResult = await testConnection(logger);
+    } catch (error) {
+      spinner.fail('Connection failed');
+      throw error;
+    }
 
     if (!connectionResult.success) {
       spinner.fail('Connection failed');
@@ -376,17 +375,23 @@ async function runAudit() {
     // Handle cache refresh if requested
     if (argv.refreshCache) {
       spinner.start('Clearing cache and fetching fresh data from SFMC...');
-      await clearFolderCache(logger);
-      spinner.succeed('Cache cleared - will fetch fresh data');
+      try {
+        await clearFolderCache(logger);
+        spinner.succeed('Cache cleared - will fetch fresh data');
+      } catch (error) {
+        spinner.fail('Failed to clear cache');
+        throw error;
+      }
     }
 
     // Find target folder
     spinner.start('Finding target folder...');
-    let targetFolder = await getFolderByPath(argv.folder, logger);
-
-    // If not found by path, try by name
-    if (!targetFolder) {
-      targetFolder = await getFolderByName(argv.folder, logger);
+    let targetFolder;
+    try {
+      targetFolder = await findFolder(argv.folder, logger);
+    } catch (error) {
+      spinner.fail('Failed to find folder');
+      throw error;
     }
 
     if (!targetFolder) {
@@ -408,7 +413,13 @@ async function runAudit() {
 
     // Get subfolders
     spinner.start('Discovering subfolders...');
-    const subfolders = await getSubfolders(targetFolder.id, true, logger);
+    let subfolders;
+    try {
+      subfolders = await getSubfolders(targetFolder.id, true, logger);
+    } catch (error) {
+      spinner.fail('Failed to discover subfolders');
+      throw error;
+    }
     const allFolders = [targetFolder, ...subfolders];
     spinner.succeed(`Found ${allFolders.length} folder(s)`);
 
@@ -420,28 +431,38 @@ async function runAudit() {
     const allDataExtensions = [];
     const deByFolder = new Map();
 
-    for (const folder of allFolders) {
-      const des = await getDataExtensionsInFolder(folder.id, logger);
-      deByFolder.set(folder.id, des);
-      allDataExtensions.push(...des);
+    try {
+      for (const folder of allFolders) {
+        const des = await getDataExtensionsInFolder(folder.id, logger);
+        deByFolder.set(folder.id, des);
+        allDataExtensions.push(...des);
+      }
+      spinner.succeed(`Found ${allDataExtensions.length} Data Extension(s)`);
+    } catch (error) {
+      spinner.fail('Failed to discover Data Extensions');
+      throw error;
     }
-    spinner.succeed(`Found ${allDataExtensions.length} Data Extension(s)`);
 
     // Get detailed info for each DE
     if (argv.includeRowCounts || argv.checkDependencies) {
       spinner.start('Gathering Data Extension details...');
 
-      for (let i = 0; i < allDataExtensions.length; i++) {
-        const de = allDataExtensions[i];
-        spinner.text = `Gathering details: ${i + 1}/${allDataExtensions.length} - ${de.name}`;
+      try {
+        for (let i = 0; i < allDataExtensions.length; i++) {
+          const de = allDataExtensions[i];
+          spinner.text = `Gathering details: ${i + 1}/${allDataExtensions.length} - ${de.name}`;
 
-        const details = await getFullDataExtensionDetails(de.customerKey, argv.includeRowCounts, logger);
-        if (details) {
-          Object.assign(de, details);
+          const details = await getFullDataExtensionDetails(de.customerKey, argv.includeRowCounts, logger);
+          if (details) {
+            Object.assign(de, details);
+          }
         }
-      }
 
-      spinner.succeed('Data Extension details gathered');
+        spinner.succeed('Data Extension details gathered');
+      } catch (error) {
+        spinner.fail('Failed to gather Data Extension details');
+        throw error;
+      }
     }
 
     // Check dependencies using smart analysis
@@ -449,41 +470,46 @@ async function runAudit() {
     if (argv.checkDependencies && allDataExtensions.length > 0) {
       spinner.start('Running smart dependency analysis...');
 
-      // Prepare DE objects for analysis (need customerKey, objectId, name)
-      const desForAnalysis = allDataExtensions.map(de => ({
-        customerKey: de.customerKey,
-        objectId: de.objectId,
-        name: de.name
-      }));
+      try {
+        // Prepare DE objects for analysis (need customerKey, objectId, name)
+        const desForAnalysis = allDataExtensions.map(de => ({
+          customerKey: de.customerKey,
+          objectId: de.objectId,
+          name: de.name
+        }));
 
-      dependencyReport = await analyzeDependencies(desForAnalysis, {
-        logger,
-        onProgress: (stage, current, total, message) => {
-          spinner.text = `${message}`;
-        }
-      });
-
-      // Merge dependency info into DE objects
-      for (const de of allDataExtensions) {
-        const deDeps = dependencyReport.deMapping?.get(de.customerKey) || [];
-        de.hasDependencies = deDeps.length > 0;
-        de.dependencyCount = deDeps.length;
-        de.dependencies = deDeps.map(ref => {
-          // Find full dependency info
-          const fullDep = dependencyReport.all.find(d => d.type === ref.type && d.id === ref.id);
-          return fullDep || ref;
+        dependencyReport = await analyzeDependencies(desForAnalysis, {
+          logger,
+          onProgress: (stage, current, total, message) => {
+            spinner.text = `${message}`;
+          }
         });
 
-        // Count safe vs blocking
-        de.safeToDeleteDeps = de.dependencies.filter(d =>
-          d.classification === DependencyClassification.SAFE_TO_DELETE
-        ).length;
-        de.blockingDeps = de.dependencies.filter(d =>
-          d.classification !== DependencyClassification.SAFE_TO_DELETE
-        ).length;
-      }
+        // Merge dependency info into DE objects
+        for (const de of allDataExtensions) {
+          const deDeps = dependencyReport.deMapping?.get(de.customerKey) || [];
+          de.hasDependencies = deDeps.length > 0;
+          de.dependencyCount = deDeps.length;
+          de.dependencies = deDeps.map(ref => {
+            // Find full dependency info
+            const fullDep = dependencyReport.all.find(d => d.type === ref.type && d.id === ref.id);
+            return fullDep || ref;
+          });
 
-      spinner.succeed(`Dependency analysis complete: ${dependencyReport.summary.safeToDelete} safe, ${dependencyReport.summary.requiresReview} require review`);
+          // Count safe vs blocking
+          de.safeToDeleteDeps = de.dependencies.filter(d =>
+            d.classification === DependencyClassification.SAFE_TO_DELETE
+          ).length;
+          de.blockingDeps = de.dependencies.filter(d =>
+            d.classification !== DependencyClassification.SAFE_TO_DELETE
+          ).length;
+        }
+
+        spinner.succeed(`Dependency analysis complete: ${dependencyReport.summary.safeToDelete} safe, ${dependencyReport.summary.requiresReview} require review`);
+      } catch (error) {
+        spinner.fail('Dependency analysis failed');
+        throw error;
+      }
     }
 
     // Update DE map with enriched data

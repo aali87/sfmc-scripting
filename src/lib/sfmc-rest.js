@@ -19,10 +19,11 @@ const { MAX_RETRIES, RETRY_DELAY_MS } = RETRY_CONFIG;
 /**
  * Create axios instance with auth headers
  * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional)
  * @returns {Promise<axios.AxiosInstance>} Configured axios instance
  */
-async function createApiClient(logger = null) {
-  const tokenInfo = await getAccessToken(logger);
+async function createApiClient(logger = null, accountId = null) {
+  const tokenInfo = await getAccessToken(logger, accountId);
 
   return axios.create({
     baseURL: tokenInfo.restInstanceUrl || config.sfmc.restUrl,
@@ -30,7 +31,7 @@ async function createApiClient(logger = null) {
       'Authorization': `Bearer ${tokenInfo.accessToken}`,
       'Content-Type': 'application/json'
     },
-    timeout: 60000
+    timeout: config.timeouts.restTimeoutMs
   });
 }
 
@@ -42,10 +43,11 @@ async function createApiClient(logger = null) {
  * @param {object} params - Query parameters
  * @param {object} logger - Logger instance
  * @param {number} retryCount - Current retry count
+ * @param {string} accountId - Business Unit account ID (optional)
  * @returns {Promise<object>} API response data
  */
-async function makeRequest(method, endpoint, data = null, params = null, logger = null, retryCount = 0) {
-  const client = await createApiClient(logger);
+async function makeRequest(method, endpoint, data = null, params = null, logger = null, retryCount = 0, accountId = null) {
+  const client = await createApiClient(logger, accountId);
 
   if (logger) {
     logger.api(method.toUpperCase(), endpoint, { params });
@@ -79,7 +81,7 @@ async function makeRequest(method, endpoint, data = null, params = null, logger 
       }
 
       await sleep(delay);
-      return makeRequest(method, endpoint, data, params, logger, retryCount + 1);
+      return makeRequest(method, endpoint, data, params, logger, retryCount + 1, accountId);
     }
 
     // Extract error message
@@ -94,9 +96,10 @@ async function makeRequest(method, endpoint, data = null, params = null, logger 
  * @param {string} itemsKey - Key containing items in response
  * @param {object} params - Additional query parameters
  * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional)
  * @returns {Promise<object[]>} All items across all pages
  */
-async function getAllPages(endpoint, itemsKey, params = {}, logger = null) {
+async function getAllPages(endpoint, itemsKey, params = {}, logger = null, accountId = null) {
   const allItems = [];
   let page = 1;
   let hasMore = true;
@@ -105,10 +108,10 @@ async function getAllPages(endpoint, itemsKey, params = {}, logger = null) {
     const pageParams = {
       ...params,
       $page: page,
-      $pageSize: 500
+      $pageSize: config.pagination.defaultPageSize
     };
 
-    const response = await makeRequest('get', endpoint, null, pageParams, logger);
+    const response = await makeRequest('get', endpoint, null, pageParams, logger, 0, accountId);
 
     // Handle different response formats
     let items = [];
@@ -127,7 +130,7 @@ async function getAllPages(endpoint, itemsKey, params = {}, logger = null) {
       hasMore = (response.page * response.pageSize) < response.count;
     } else if (items.length === 0) {
       hasMore = false;
-    } else if (items.length < (pageParams.$pageSize || 500)) {
+    } else if (items.length < (pageParams.$pageSize || config.pagination.defaultPageSize)) {
       hasMore = false;
     }
 
@@ -150,9 +153,9 @@ async function getAllPages(endpoint, itemsKey, params = {}, logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<object[]>} Array of automation objects
  */
-export async function getAutomations(logger = null) {
+export async function getAutomations(logger = null, accountId = null) {
   try {
-    const automations = await getAllPages('/automation/v1/automations', 'items', {}, logger);
+    const automations = await getAllPages('/automation/v1/automations', 'items', {}, logger, accountId);
 
     if (logger) {
       logger.debug(`Retrieved ${automations.length} automations`);
@@ -173,7 +176,7 @@ export async function getAutomations(logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<object>} Automation details
  */
-export async function getAutomationDetails(automationId, logger = null) {
+export async function getAutomationDetails(automationId, logger = null, accountId = null) {
   return makeRequest('get', `/automation/v1/automations/${automationId}`, null, null, logger);
 }
 
@@ -184,10 +187,10 @@ export async function getAutomationDetails(automationId, logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<object|null>} Automation object or null if not found
  */
-export async function getAutomationByName(automationName, automations = null, logger = null) {
+export async function getAutomationByName(automationName, automations = null, logger = null, accountId = null) {
   try {
     if (!automations) {
-      automations = await getAutomations(logger);
+      automations = await getAutomations(logger, accountId);
     }
 
     const nameLower = automationName.toLowerCase().trim();
@@ -211,9 +214,9 @@ export async function getAutomationByName(automationName, automations = null, lo
  * @param {object} logger - Logger instance
  * @returns {Promise<object>} Automation with full metadata
  */
-export async function getAutomationWithMetadata(automationId, logger = null) {
+export async function getAutomationWithMetadata(automationId, logger = null, accountId = null) {
   try {
-    const automation = await getAutomationDetails(automationId, logger);
+    const automation = await getAutomationDetails(automationId, logger, accountId);
 
     // The REST API returns these fields directly:
     // - createdDate
@@ -253,7 +256,7 @@ export async function getAutomationWithMetadata(automationId, logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<{success: boolean, error?: string}>} Deletion result
  */
-export async function deleteAutomation(automationId, logger = null) {
+export async function deleteAutomation(automationId, logger = null, accountId = null) {
   try {
     await makeRequest('delete', `/automation/v1/automations/${automationId}`, null, null, logger);
 
@@ -300,7 +303,7 @@ export function createAutomationBackup(automation) {
  * @param {object} logger - Logger instance
  * @returns {Promise<object[]>} Array of journey objects
  */
-export async function getJourneys(logger = null) {
+export async function getJourneys(logger = null, accountId = null) {
   try {
     // Journey API uses different pagination
     const allJourneys = [];
@@ -310,13 +313,13 @@ export async function getJourneys(logger = null) {
     while (hasMore) {
       const response = await makeRequest('get', '/interaction/v1/interactions', null, {
         $page: page,
-        $pageSize: 100
+        $pageSize: config.pagination.journeyPageSize
       }, logger);
 
       const items = response.items || [];
       allJourneys.push(...items);
 
-      hasMore = items.length === 100;
+      hasMore = items.length === config.pagination.journeyPageSize;
       page++;
     }
 
@@ -339,7 +342,7 @@ export async function getJourneys(logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<object>} Journey details
  */
-export async function getJourneyDetails(journeyId, logger = null) {
+export async function getJourneyDetails(journeyId, logger = null, accountId = null) {
   return makeRequest('get', `/interaction/v1/interactions/${journeyId}`, null, null, logger);
 }
 
@@ -353,7 +356,7 @@ export async function getJourneyDetails(journeyId, logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<number>} Row count
  */
-export async function getDataExtensionRowCount(deKey, logger = null) {
+export async function getDataExtensionRowCount(deKey, logger = null, accountId = null) {
   try {
     // Use the rowset endpoint with count
     const response = await makeRequest('get', `/data/v1/customobjectdata/key/${encodeURIComponent(deKey)}/rowset`, null, {
@@ -390,9 +393,9 @@ export async function getDataExtensionRowCount(deKey, logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<object[]>} Array of filter activity objects
  */
-export async function getFilterActivities(logger = null) {
+export async function getFilterActivities(logger = null, accountId = null) {
   try {
-    const filters = await getAllPages('/automation/v1/filters', 'items', {}, logger);
+    const filters = await getAllPages('/automation/v1/filters', 'items', {}, logger, accountId);
 
     if (logger) {
       logger.debug(`Retrieved ${filters.length} filter activities`);
@@ -413,7 +416,7 @@ export async function getFilterActivities(logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<object|null>} Filter details or null if not found
  */
-export async function getFilterActivityDetails(filterId, logger = null) {
+export async function getFilterActivityDetails(filterId, logger = null, accountId = null) {
   try {
     return await makeRequest('get', `/automation/v1/filters/${filterId}`, null, null, logger);
   } catch (error) {
@@ -431,7 +434,7 @@ export async function getFilterActivityDetails(filterId, logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<{success: boolean, error?: string}>} Deletion result
  */
-export async function deleteFilterActivity(filterId, logger = null) {
+export async function deleteFilterActivity(filterId, logger = null, accountId = null) {
   try {
     await makeRequest('delete', `/automation/v1/filters/${filterId}`, null, null, logger);
 
@@ -461,11 +464,11 @@ export async function deleteFilterActivity(filterId, logger = null) {
  * @param {object} logger - Logger instance
  * @returns {Promise<{isUsed: boolean, automations: object[]}>} Usage info
  */
-export async function checkFilterInAutomations(filterId, automations = null, logger = null) {
+export async function checkFilterInAutomations(filterId, automations = null, logger = null, accountId = null) {
   try {
     // If automations not provided, fetch them
     if (!automations) {
-      automations = await getAutomations(logger);
+      automations = await getAutomations(logger, accountId);
     }
 
     const usedIn = [];
@@ -474,7 +477,7 @@ export async function checkFilterInAutomations(filterId, automations = null, log
       // Get full automation details to check activities
       let automationDetails;
       try {
-        automationDetails = await getAutomationDetails(automation.id, logger);
+        automationDetails = await getAutomationDetails(automation.id, logger, accountId);
       } catch (e) {
         // Skip if can't get details
         continue;
@@ -486,10 +489,11 @@ export async function checkFilterInAutomations(filterId, automations = null, log
           if (step.activities) {
             for (const activity of step.activities) {
               // Filter activities have objectTypeId 303
-              // Also check the activityObjectId matches
-              if (activity.objectTypeId === 303 ||
-                  activity.activityObjectId === filterId ||
-                  (activity.id && activity.id === filterId)) {
+              // Must check BOTH objectTypeId AND activityObjectId to avoid false positives
+              const isFilterActivity = activity.objectTypeId === 303;
+              const matchesFilterId = activity.activityObjectId === filterId ||
+                  (activity.id && activity.id === filterId);
+              if (isFilterActivity && matchesFilterId) {
                 usedIn.push({
                   automationId: automation.id,
                   automationName: automation.name,
@@ -526,9 +530,9 @@ export async function checkFilterInAutomations(filterId, automations = null, log
  * @param {object} logger - Logger instance
  * @returns {Promise<object[]>} Array of data extract objects
  */
-export async function getDataExtracts(logger = null) {
+export async function getDataExtracts(logger = null, accountId = null) {
   try {
-    const extracts = await getAllPages('/automation/v1/dataextracts', 'items', {}, logger);
+    const extracts = await getAllPages('/automation/v1/dataextracts', 'items', {}, logger, accountId);
 
     if (logger) {
       logger.debug(`Retrieved ${extracts.length} data extract activities`);
@@ -562,7 +566,7 @@ export async function sendWebhook(url, payload, logger = null) {
   try {
     await axios.post(url, payload, {
       headers: { 'Content-Type': 'application/json' },
-      timeout: 10000
+      timeout: config.timeouts.webhookTimeoutMs
     });
 
     if (logger) {
@@ -575,6 +579,302 @@ export async function sendWebhook(url, payload, logger = null) {
       logger.warn(`Webhook notification failed: ${error.message}`);
     }
     return false;
+  }
+}
+
+// =============================================================================
+// File Transfer APIs
+// =============================================================================
+
+/**
+ * Get all file transfer activities
+ * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional)
+ * @returns {Promise<object[]>} Array of file transfer objects
+ */
+export async function getFileTransfers(logger = null, accountId = null) {
+  try {
+    const transfers = await getAllPages('/automation/v1/filetransfers', 'items', {}, logger, accountId);
+
+    if (logger) {
+      logger.debug(`Retrieved ${transfers.length} file transfer activities`);
+    }
+
+    return transfers;
+  } catch (error) {
+    if (logger) {
+      logger.debug(`Failed to retrieve file transfers: ${error.message}`);
+    }
+    return [];
+  }
+}
+
+/**
+ * Get file transfer details by ID
+ * @param {string} fileTransferId - File Transfer Activity ID
+ * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional)
+ * @returns {Promise<object|null>} File transfer details or null if not found
+ */
+export async function getFileTransferDetails(fileTransferId, logger = null, accountId = null) {
+  try {
+    return await makeRequest('get', `/automation/v1/filetransfers/${fileTransferId}`, null, null, logger);
+  } catch (error) {
+    if (logger) {
+      logger.debug(`Failed to get file transfer details for ${fileTransferId}: ${error.message}`);
+    }
+    return null;
+  }
+}
+
+/**
+ * Update a file transfer activity
+ * @param {string} fileTransferId - File Transfer Activity ID
+ * @param {object} updates - Fields to update (e.g., { fileNamePattern: 'new_file.csv' })
+ * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional)
+ * @returns {Promise<{success: boolean, data?: object, error?: string}>} Update result
+ */
+export async function updateFileTransfer(fileTransferId, updates, logger = null, accountId = null) {
+  try {
+    const result = await makeRequest('patch', `/automation/v1/filetransfers/${fileTransferId}`, updates, null, logger);
+
+    if (logger) {
+      logger.info(`Successfully updated file transfer: ${fileTransferId}`);
+    }
+
+    return { success: true, data: result };
+  } catch (error) {
+    const errorMessage = error.message || 'Unknown error';
+
+    if (logger) {
+      logger.error(`Failed to update file transfer ${fileTransferId}: ${errorMessage}`);
+    }
+
+    return { success: false, error: errorMessage };
+  }
+}
+
+// =============================================================================
+// Import Definition APIs
+// =============================================================================
+
+/**
+ * Get all import definitions via REST API
+ * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional)
+ * @returns {Promise<object[]>} Array of import definition objects
+ */
+export async function getImports(logger = null, accountId = null) {
+  try {
+    const imports = await getAllPages('/automation/v1/imports', 'items', {}, logger, accountId);
+
+    if (logger) {
+      logger.debug(`Retrieved ${imports.length} import definitions`);
+    }
+
+    return imports;
+  } catch (error) {
+    if (logger) {
+      logger.debug(`Failed to retrieve imports: ${error.message}`);
+    }
+    return [];
+  }
+}
+
+/**
+ * Get import definition details by ID
+ * @param {string} importId - Import Definition ID
+ * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional)
+ * @returns {Promise<object|null>} Import details or null if not found
+ */
+export async function getImportDetails(importId, logger = null, accountId = null) {
+  try {
+    return await makeRequest('get', `/automation/v1/imports/${importId}`, null, null, logger);
+  } catch (error) {
+    if (logger) {
+      logger.debug(`Failed to get import details for ${importId}: ${error.message}`);
+    }
+    return null;
+  }
+}
+
+/**
+ * Update an import definition
+ * @param {string} importId - Import Definition ID
+ * @param {object} updates - Fields to update (e.g., { destinationObjectId: 'DE_Key', fileSpec: 'file.csv' })
+ * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional)
+ * @returns {Promise<{success: boolean, data?: object, error?: string}>} Update result
+ */
+export async function updateImport(importId, updates, logger = null, accountId = null) {
+  try {
+    const result = await makeRequest('patch', `/automation/v1/imports/${importId}`, updates, null, logger);
+
+    if (logger) {
+      logger.info(`Successfully updated import definition: ${importId}`);
+    }
+
+    return { success: true, data: result };
+  } catch (error) {
+    const errorMessage = error.message || 'Unknown error';
+
+    if (logger) {
+      logger.error(`Failed to update import ${importId}: ${errorMessage}`);
+    }
+
+    return { success: false, error: errorMessage };
+  }
+}
+
+// =============================================================================
+// Automation Execution APIs
+// =============================================================================
+
+/**
+ * Trigger an automation to run once
+ * @param {string} automationId - Automation ID
+ * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional)
+ * @returns {Promise<{success: boolean, data?: object, error?: string}>} Trigger result
+ */
+export async function runAutomationOnce(automationId, logger = null, accountId = null) {
+  try {
+    const result = await makeRequest('post', `/automation/v1/automations/${automationId}/actions/runallonce`, null, null, logger);
+
+    if (logger) {
+      logger.info(`Successfully triggered automation: ${automationId}`);
+    }
+
+    return { success: true, data: result };
+  } catch (error) {
+    const errorMessage = error.message || 'Unknown error';
+
+    if (logger) {
+      logger.error(`Failed to trigger automation ${automationId}: ${errorMessage}`);
+    }
+
+    return { success: false, error: errorMessage };
+  }
+}
+
+// =============================================================================
+// Content Builder / CloudPages APIs
+// =============================================================================
+
+/**
+ * Query Content Builder assets with filters
+ * @param {object} queryPayload - Query payload with filters
+ * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional)
+ * @returns {Promise<object[]>} Array of asset objects
+ */
+export async function queryAssets(queryPayload, logger = null, accountId = null) {
+  try {
+    const allAssets = [];
+    let page = 1;
+    let hasMore = true;
+
+    while (hasMore) {
+      const payload = {
+        ...queryPayload,
+        page: {
+          page: page,
+          pageSize: 50
+        }
+      };
+
+      const response = await makeRequest('post', '/asset/v1/content/assets/query', payload, null, logger);
+
+      if (response.items && Array.isArray(response.items)) {
+        allAssets.push(...response.items);
+      }
+
+      // Check if more pages exist
+      if (response.count && response.page) {
+        const totalPages = Math.ceil(response.count / (response.pageSize || 50));
+        hasMore = page < totalPages;
+      } else {
+        hasMore = response.items && response.items.length === 50;
+      }
+
+      page++;
+
+      if (logger) {
+        logger.debug(`Fetched asset page ${page - 1}: ${response.items?.length || 0} items (total: ${allAssets.length})`);
+      }
+    }
+
+    return allAssets;
+  } catch (error) {
+    if (logger) {
+      logger.error(`Failed to query assets: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Get all CloudPages (Landing Pages) in the Business Unit
+ * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional)
+ * @returns {Promise<object[]>} Array of CloudPage asset objects
+ */
+export async function getCloudPages(logger = null, accountId = null) {
+  const queryPayload = {
+    query: {
+      leftOperand: {
+        property: 'assetType.id',
+        simpleOperator: 'equal',
+        value: 205
+      },
+      logicalOperator: 'OR',
+      rightOperand: {
+        property: 'assetType.id',
+        simpleOperator: 'equal',
+        value: 247
+      }
+    },
+    fields: [
+      'id', 'customerKey', 'objectID', 'assetType', 'name', 'description',
+      'content', 'views', 'createdDate', 'createdBy', 'modifiedDate', 'modifiedBy',
+      'status', 'category', 'data', 'meta'
+    ],
+    sort: [{ property: 'modifiedDate', direction: 'DESC' }]
+  };
+
+  try {
+    const assets = await queryAssets(queryPayload, logger, accountId);
+
+    if (logger) {
+      logger.debug(`Retrieved ${assets.length} CloudPages`);
+    }
+
+    return assets;
+  } catch (error) {
+    if (logger) {
+      logger.error(`Failed to retrieve CloudPages: ${error.message}`);
+    }
+    return [];
+  }
+}
+
+/**
+ * Get CloudPage details by ID including full content
+ * @param {string|number} assetId - Asset ID
+ * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional)
+ * @returns {Promise<object|null>} CloudPage details or null if not found
+ */
+export async function getCloudPageDetails(assetId, logger = null, accountId = null) {
+  try {
+    return await makeRequest('get', `/asset/v1/content/assets/${assetId}`, null, null, logger);
+  } catch (error) {
+    if (logger) {
+      logger.debug(`Failed to get CloudPage details for ${assetId}: ${error.message}`);
+    }
+    return null;
   }
 }
 
@@ -593,5 +893,15 @@ export default {
   deleteFilterActivity,
   checkFilterInAutomations,
   getDataExtracts,
-  sendWebhook
+  sendWebhook,
+  getFileTransfers,
+  getFileTransferDetails,
+  updateFileTransfer,
+  getImports,
+  getImportDetails,
+  updateImport,
+  runAutomationOnce,
+  queryAssets,
+  getCloudPages,
+  getCloudPageDetails
 };

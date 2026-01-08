@@ -101,11 +101,134 @@ export function calculateBackoffDelay(retryCount, baseDelay = RETRY_CONFIG.RETRY
   return baseDelay * Math.pow(2, retryCount);
 }
 
+/**
+ * Escape a value for CSV output (RFC 4180 compliant)
+ * @param {*} val - Value to escape
+ * @returns {string} CSV-safe string
+ */
+export function escapeCSV(val) {
+  if (val === null || val === undefined) return '';
+  const str = String(val);
+  if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+/**
+ * Format a date string for display
+ * @param {string|Date} dateStr - Date string or Date object
+ * @param {string} format - Output format (default: 'YYYY-MM-DD HH:mm:ss')
+ * @returns {string} Formatted date string or 'N/A' if invalid
+ */
+export function formatDate(dateStr, format = 'YYYY-MM-DD HH:mm:ss') {
+  if (!dateStr) return 'N/A';
+  try {
+    const date = new Date(dateStr);
+    if (isNaN(date.getTime())) return 'N/A';
+
+    const pad = (n) => String(n).padStart(2, '0');
+    const year = date.getFullYear();
+    const month = pad(date.getMonth() + 1);
+    const day = pad(date.getDate());
+    const hours = pad(date.getHours());
+    const minutes = pad(date.getMinutes());
+    const seconds = pad(date.getSeconds());
+
+    return format
+      .replace('YYYY', year)
+      .replace('MM', month)
+      .replace('DD', day)
+      .replace('HH', hours)
+      .replace('mm', minutes)
+      .replace('ss', seconds);
+  } catch {
+    return 'N/A';
+  }
+}
+
+/**
+ * Format a number with thousands separators
+ * @param {number|string} num - Number to format
+ * @returns {string} Formatted number or 'N/A' if invalid
+ */
+export function formatNumber(num) {
+  if (num === null || num === undefined) return 'N/A';
+  const n = Number(num);
+  if (isNaN(n)) return 'N/A';
+  return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+/**
+ * Escape special regex characters in a string
+ * @param {string} str - String to escape
+ * @returns {string} Escaped string safe for use in RegExp
+ */
+export function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Get or create a Map entry with a default value
+ * @param {Map} map - Map to operate on
+ * @param {*} key - Key to look up
+ * @param {*} defaultValue - Default value if key doesn't exist
+ * @returns {*} The value for the key
+ */
+export function getOrCreateMapEntry(map, key, defaultValue) {
+  if (!map.has(key)) {
+    map.set(key, typeof defaultValue === 'function' ? defaultValue() : defaultValue);
+  }
+  return map.get(key);
+}
+
+/**
+ * Create a concurrency limiter for parallel async operations
+ * Ensures at most `limit` operations run concurrently
+ * @param {number} limit - Maximum concurrent operations
+ * @returns {function} Limiter function that wraps async functions
+ * @example
+ * const limit = createConcurrencyLimiter(5);
+ * const results = await Promise.all(items.map(item => limit(() => fetchItem(item))));
+ */
+export function createConcurrencyLimiter(limit) {
+  let running = 0;
+  const queue = [];
+
+  const runNext = () => {
+    if (queue.length === 0 || running >= limit) return;
+
+    running++;
+    const { fn, resolve, reject } = queue.shift();
+
+    fn()
+      .then(resolve)
+      .catch(reject)
+      .finally(() => {
+        running--;
+        runNext();
+      });
+  };
+
+  return (fn) => {
+    return new Promise((resolve, reject) => {
+      queue.push({ fn, resolve, reject });
+      runNext();
+    });
+  };
+}
+
 export default {
   sleep,
   extractErrorMessage,
   isRetryableError,
   calculateBackoffDelay,
+  escapeCSV,
+  formatDate,
+  formatNumber,
+  escapeRegex,
+  getOrCreateMapEntry,
+  createConcurrencyLimiter,
   RETRY_CONFIG,
   CACHE_CONFIG
 };

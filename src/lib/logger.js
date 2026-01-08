@@ -11,9 +11,13 @@ import config from '../config/index.js';
 
 const { combine, timestamp, printf, colorize, errors } = winston.format;
 
-// Ensure logs directory exists
-if (!fs.existsSync(config.paths.logs)) {
-  fs.mkdirSync(config.paths.logs, { recursive: true });
+// Ensure logs directory exists (sync at module load is intentional for guaranteed logging)
+try {
+  if (!fs.existsSync(config.paths.logs)) {
+    fs.mkdirSync(config.paths.logs, { recursive: true });
+  }
+} catch (error) {
+  console.error(`Failed to create logs directory: ${error.message}`);
 }
 
 // Custom format for console output
@@ -116,9 +120,13 @@ export function createAuditLogger(operationType) {
   const auditFilename = `${operationId}.json`;
   const auditPath = path.join(config.paths.audit, auditFilename);
 
-  // Ensure audit directory exists
-  if (!fs.existsSync(config.paths.audit)) {
-    fs.mkdirSync(config.paths.audit, { recursive: true });
+  // Ensure audit directory exists (sync for initialization simplicity, with error handling)
+  try {
+    if (!fs.existsSync(config.paths.audit)) {
+      fs.mkdirSync(config.paths.audit, { recursive: true });
+    }
+  } catch (error) {
+    console.error(`Failed to create audit directory: ${error.message}`);
   }
 
   const auditData = {
@@ -221,7 +229,33 @@ export function createAuditLogger(operationType) {
       const durationMs = endTime - startTime;
       auditData.duration = `${Math.round(durationMs / 1000)} seconds`;
 
-      fs.writeFileSync(auditPath, JSON.stringify(auditData, null, 2));
+      try {
+        fs.writeFileSync(auditPath, JSON.stringify(auditData, null, 2));
+      } catch (error) {
+        console.error(`Failed to write audit log: ${error.message}`);
+      }
+      return auditPath;
+    },
+
+    /**
+     * Save the audit log to file asynchronously
+     * @param {number} exitCode - Script exit code
+     * @returns {Promise<string>} Path to saved audit file
+     */
+    async saveAsync(exitCode = 0) {
+      auditData.completedAt = new Date().toISOString();
+      auditData.exitCode = exitCode;
+
+      const startTime = new Date(auditData.startedAt).getTime();
+      const endTime = new Date(auditData.completedAt).getTime();
+      const durationMs = endTime - startTime;
+      auditData.duration = `${Math.round(durationMs / 1000)} seconds`;
+
+      try {
+        await fs.promises.writeFile(auditPath, JSON.stringify(auditData, null, 2));
+      } catch (error) {
+        console.error(`Failed to write audit log: ${error.message}`);
+      }
       return auditPath;
     },
 
@@ -243,9 +277,13 @@ export function createAuditLogger(operationType) {
 export function createStateManager(operationId) {
   const statePath = path.join(config.paths.state, `${operationId}.json`);
 
-  // Ensure state directory exists
-  if (!fs.existsSync(config.paths.state)) {
-    fs.mkdirSync(config.paths.state, { recursive: true });
+  // Ensure state directory exists (sync for initialization simplicity, with error handling)
+  try {
+    if (!fs.existsSync(config.paths.state)) {
+      fs.mkdirSync(config.paths.state, { recursive: true });
+    }
+  } catch (error) {
+    console.error(`Failed to create state directory: ${error.message}`);
   }
 
   return {
@@ -253,7 +291,7 @@ export function createStateManager(operationId) {
     statePath,
 
     /**
-     * Save current operation state
+     * Save current operation state (synchronous for guaranteed persistence)
      * @param {object} state - State to persist
      */
     save(state) {
@@ -262,17 +300,60 @@ export function createStateManager(operationId) {
         savedAt: new Date().toISOString(),
         ...state
       };
-      fs.writeFileSync(statePath, JSON.stringify(stateData, null, 2));
+      try {
+        fs.writeFileSync(statePath, JSON.stringify(stateData, null, 2));
+      } catch (error) {
+        console.error(`Failed to save state: ${error.message}`);
+      }
     },
 
     /**
-     * Load previously saved state
+     * Save current operation state asynchronously
+     * @param {object} state - State to persist
+     * @returns {Promise<void>}
+     */
+    async saveAsync(state) {
+      const stateData = {
+        operationId,
+        savedAt: new Date().toISOString(),
+        ...state
+      };
+      try {
+        await fs.promises.writeFile(statePath, JSON.stringify(stateData, null, 2));
+      } catch (error) {
+        console.error(`Failed to save state: ${error.message}`);
+      }
+    },
+
+    /**
+     * Load previously saved state (synchronous)
      * @returns {object|null} Saved state or null if not found
      */
     load() {
-      if (fs.existsSync(statePath)) {
-        const data = fs.readFileSync(statePath, 'utf8');
+      try {
+        if (fs.existsSync(statePath)) {
+          const data = fs.readFileSync(statePath, 'utf8');
+          return JSON.parse(data);
+        }
+      } catch (error) {
+        console.error(`Failed to load state: ${error.message}`);
+      }
+      return null;
+    },
+
+    /**
+     * Load previously saved state asynchronously
+     * @returns {Promise<object|null>} Saved state or null if not found
+     */
+    async loadAsync() {
+      try {
+        await fs.promises.access(statePath);
+        const data = await fs.promises.readFile(statePath, 'utf8');
         return JSON.parse(data);
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          console.error(`Failed to load state: ${error.message}`);
+        }
       }
       return null;
     },
@@ -282,15 +363,51 @@ export function createStateManager(operationId) {
      * @returns {boolean}
      */
     exists() {
-      return fs.existsSync(statePath);
+      try {
+        return fs.existsSync(statePath);
+      } catch (error) {
+        console.error(`Failed to check state existence: ${error.message}`);
+        return false;
+      }
+    },
+
+    /**
+     * Check if state file exists asynchronously
+     * @returns {Promise<boolean>}
+     */
+    async existsAsync() {
+      try {
+        await fs.promises.access(statePath);
+        return true;
+      } catch {
+        return false;
+      }
     },
 
     /**
      * Delete state file (after successful completion)
      */
     clear() {
-      if (fs.existsSync(statePath)) {
-        fs.unlinkSync(statePath);
+      try {
+        if (fs.existsSync(statePath)) {
+          fs.unlinkSync(statePath);
+        }
+      } catch (error) {
+        console.error(`Failed to clear state: ${error.message}`);
+      }
+    },
+
+    /**
+     * Delete state file asynchronously
+     * @returns {Promise<void>}
+     */
+    async clearAsync() {
+      try {
+        await fs.promises.unlink(statePath);
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          console.error(`Failed to clear state: ${error.message}`);
+        }
       }
     }
   };

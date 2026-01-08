@@ -26,6 +26,10 @@ let memoryCache = {
   loadedAt: null
 };
 
+// Track in-flight requests to prevent duplicate API calls
+// Key: accountId, Value: Promise that resolves to folders
+const inFlightRequests = new Map();
+
 /**
  * Clear both in-memory and file-based cache
  * @param {object} logger - Logger instance
@@ -52,29 +56,33 @@ export async function getFolderCacheStatus() {
  * Load all folders (with persistent file caching)
  * @param {object} logger - Logger instance
  * @param {boolean} forceRefresh - Force cache refresh (--refresh-cache flag)
+ * @param {string} accountId - Business Unit account ID (optional, defaults to config)
  * @returns {Promise<object[]>} Array of folder objects
  */
-async function loadAllFolders(logger = null, forceRefresh = false) {
+export async function loadAllFolders(logger = null, forceRefresh = false, accountId = null) {
   const now = Date.now();
-  const accountId = config.sfmc.accountId;
+  const effectiveAccountId = accountId || config.sfmc.accountId;
 
   // Check in-memory cache first (fastest)
-  if (!forceRefresh && memoryCache.folders && memoryCache.loadedAt) {
+  // Store reference to avoid race condition
+  const cachedFolders = memoryCache.folders;
+  const cachedAt = memoryCache.loadedAt;
+  if (!forceRefresh && cachedFolders && cachedAt) {
     if (logger) {
       logger.debug('Using in-memory folder cache');
     }
-    return memoryCache.folders;
+    return cachedFolders;
   }
 
   // Check file cache (unless force refresh)
   if (!forceRefresh) {
-    const cached = await readCache(FOLDER_CACHE_TYPE, accountId, {
+    const cached = await readCache(FOLDER_CACHE_TYPE, effectiveAccountId, {
       maxAgeMs: DEFAULT_CACHE_EXPIRY_MS,
       ignoreExpiry: false
     });
 
     if (cached && cached.data) {
-      const info = await getCacheInfo(FOLDER_CACHE_TYPE, accountId);
+      const info = await getCacheInfo(FOLDER_CACHE_TYPE, effectiveAccountId);
       if (logger) {
         logger.info(`Using cached folder data (${info.ageString}, ${cached.data.length} folders)`);
       }
@@ -89,49 +97,67 @@ async function loadAllFolders(logger = null, forceRefresh = false) {
     }
   }
 
-  // Fetch from SFMC API
-  if (logger) {
-    logger.info('Fetching folder structure from SFMC API (this may take a moment)...');
+  // Check if there's already an in-flight request for this account
+  // This prevents duplicate API calls when multiple operations request folders concurrently
+  if (inFlightRequests.has(effectiveAccountId)) {
+    if (logger) {
+      logger.debug('Waiting for in-flight folder request...');
+    }
+    return inFlightRequests.get(effectiveAccountId);
   }
 
-  // Filter to only get dataextension content type folders
-  const filter = buildSimpleFilter('ContentType', 'equals', 'dataextension');
-  const folders = await retrieveFolders(filter, logger);
+  // Create the fetch promise and track it
+  const fetchPromise = (async () => {
+    try {
+      // Fetch from SFMC API
+      if (logger) {
+        logger.info('Fetching folder structure from SFMC API (this may take a moment)...');
+      }
 
-  // Normalize folder data
-  const normalizedFolders = folders.map(f => ({
-    id: parseInt(f.ID, 10),
-    name: f.Name,
-    description: f.Description || '',
-    contentType: f.ContentType,
-    parentFolderId: f.ParentFolder?.ID ? parseInt(f.ParentFolder.ID, 10) : null,
-    parentFolderName: f.ParentFolder?.Name || null,
-    customerKey: f.CustomerKey,
-    isActive: f.IsActive === 'true',
-    isEditable: f.IsEditable === 'true',
-    allowChildren: f.AllowChildren === 'true',
-    createdDate: f.CreatedDate,
-    modifiedDate: f.ModifiedDate,
-    objectId: f.ObjectID,
-    isProtected: isFolderProtected(f.Name)
-  }));
+      // Filter to only get dataextension content type folders
+      const filter = buildSimpleFilter('ContentType', 'equals', 'dataextension');
+      const folders = await retrieveFolders(filter, logger, effectiveAccountId);
 
-  // Save to file cache
-  await writeCache(FOLDER_CACHE_TYPE, accountId, normalizedFolders, {
-    folderCount: normalizedFolders.length
-  });
+      // Normalize folder data
+      const normalizedFolders = folders.map(rawFolder => ({
+        id: parseInt(rawFolder.ID, 10),
+        name: rawFolder.Name,
+        description: rawFolder.Description || '',
+        contentType: rawFolder.ContentType,
+        parentFolderId: rawFolder.ParentFolder?.ID ? parseInt(rawFolder.ParentFolder.ID, 10) : null,
+        parentFolderName: rawFolder.ParentFolder?.Name || null,
+        customerKey: rawFolder.CustomerKey,
+        isActive: rawFolder.IsActive === 'true',
+        isEditable: rawFolder.IsEditable === 'true',
+        allowChildren: rawFolder.AllowChildren === 'true',
+        createdDate: rawFolder.CreatedDate,
+        modifiedDate: rawFolder.ModifiedDate,
+        objectId: rawFolder.ObjectID,
+        isProtected: isFolderProtected(rawFolder.Name)
+      }));
 
-  // Update in-memory cache
-  memoryCache = {
-    folders: normalizedFolders,
-    loadedAt: now
-  };
+      // Save to file cache
+      await writeCache(FOLDER_CACHE_TYPE, effectiveAccountId, normalizedFolders, {
+        folderCount: normalizedFolders.length
+      });
 
-  if (logger) {
-    logger.info(`Cached ${normalizedFolders.length} folders (cache will be used for future operations)`);
-  }
+      // Update in-memory cache
+      memoryCache = {
+        folders: normalizedFolders,
+        loadedAt: Date.now()
+      };
 
-  return normalizedFolders;
+      return normalizedFolders;
+    } finally {
+      // Remove from in-flight tracking when done (success or failure)
+      inFlightRequests.delete(effectiveAccountId);
+    }
+  })();
+
+  // Track the in-flight request
+  inFlightRequests.set(effectiveAccountId, fetchPromise);
+
+  return fetchPromise;
 }
 
 /**
@@ -145,10 +171,10 @@ function buildFolderPath(folderId, allFolders) {
   let currentId = folderId;
 
   while (currentId) {
-    const folder = allFolders.find(f => f.id === currentId);
+    const folder = allFolders.find(folder => folder.id === currentId);
     if (!folder) break;
 
-    pathParts.unshift(folder.name);
+    pathParts.unshift(folder.name ?? 'Unknown');
     currentId = folder.parentFolderId;
   }
 
@@ -177,11 +203,11 @@ export async function getFolderByPath(path, logger = null) {
   for (let i = 0; i < pathParts.length; i++) {
     const partName = pathParts[i].toLowerCase();
 
-    const matches = allFolders.filter(f => {
-      const nameMatch = f.name.toLowerCase() === partName;
+    const matches = allFolders.filter(folder => {
+      const nameMatch = folder.name.toLowerCase() === partName;
       const parentMatch = currentParentId === null ?
-        f.parentFolderId === null || f.parentFolderId === 0 :
-        f.parentFolderId === currentParentId;
+        folder.parentFolderId === null || folder.parentFolderId === 0 :
+        folder.parentFolderId === currentParentId;
       return nameMatch && parentMatch;
     });
 
@@ -189,8 +215,8 @@ export async function getFolderByPath(path, logger = null) {
       // If this is the first part and we didn't find an exact match,
       // try finding by name only (more lenient)
       if (i === 0) {
-        const looseMatch = allFolders.find(f =>
-          f.name.toLowerCase() === partName
+        const looseMatch = allFolders.find(folder =>
+          folder.name.toLowerCase() === partName
         );
         if (looseMatch) {
           currentParentId = looseMatch.id;
@@ -208,7 +234,7 @@ export async function getFolderByPath(path, logger = null) {
   }
 
   // Get the final folder
-  const folder = allFolders.find(f => f.id === currentParentId);
+  const folder = allFolders.find(folder => folder.id === currentParentId);
   if (folder) {
     folder.path = buildFolderPath(folder.id, allFolders);
   }
@@ -224,7 +250,7 @@ export async function getFolderByPath(path, logger = null) {
  */
 export async function getFolderByName(name, logger = null) {
   const allFolders = await loadAllFolders(logger);
-  const folder = allFolders.find(f => f.name.toLowerCase() === name.toLowerCase());
+  const folder = allFolders.find(folder => folder.name.toLowerCase() === name.toLowerCase());
 
   if (folder) {
     folder.path = buildFolderPath(folder.id, allFolders);
@@ -241,7 +267,7 @@ export async function getFolderByName(name, logger = null) {
  */
 export async function getFolderById(folderId, logger = null) {
   const allFolders = await loadAllFolders(logger);
-  const folder = allFolders.find(f => f.id === folderId);
+  const folder = allFolders.find(folder => folder.id === folderId);
 
   if (folder) {
     folder.path = buildFolderPath(folder.id, allFolders);
@@ -261,18 +287,18 @@ export async function getSubfolders(parentId, recursive = true, logger = null) {
   const allFolders = await loadAllFolders(logger);
 
   // Find direct children
-  const directChildren = allFolders.filter(f => f.parentFolderId === parentId);
+  const directChildren = allFolders.filter(folder => folder.parentFolderId === parentId);
 
   if (!recursive) {
-    return directChildren.map(f => ({
-      ...f,
-      path: buildFolderPath(f.id, allFolders)
+    return directChildren.map(child => ({
+      ...child,
+      path: buildFolderPath(child.id, allFolders)
     }));
   }
 
   // Recursively collect all descendants
   const collectDescendants = (parentIds) => {
-    const children = allFolders.filter(f => parentIds.includes(f.parentFolderId));
+    const children = allFolders.filter(folder => parentIds.includes(folder.parentFolderId));
     if (children.length === 0) {
       return [];
     }
@@ -282,9 +308,9 @@ export async function getSubfolders(parentId, recursive = true, logger = null) {
 
   const allDescendants = collectDescendants([parentId]);
 
-  return allDescendants.map(f => ({
-    ...f,
-    path: buildFolderPath(f.id, allFolders)
+  return allDescendants.map(descendant => ({
+    ...descendant,
+    path: buildFolderPath(descendant.id, allFolders)
   }));
 }
 
@@ -296,19 +322,19 @@ export async function getSubfolders(parentId, recursive = true, logger = null) {
  */
 export async function getFolderTree(parentId, logger = null) {
   const allFolders = await loadAllFolders(logger);
-  const rootFolder = allFolders.find(f => f.id === parentId);
+  const rootFolder = allFolders.find(folder => folder.id === parentId);
 
   if (!rootFolder) {
     return null;
   }
 
   const buildTree = (folderId, depth = 0) => {
-    const folder = allFolders.find(f => f.id === folderId);
+    const folder = allFolders.find(folder => folder.id === folderId);
     if (!folder) return null;
 
     const children = allFolders
-      .filter(f => f.parentFolderId === folderId)
-      .map(f => buildTree(f.id, depth + 1))
+      .filter(childFolder => childFolder.parentFolderId === folderId)
+      .map(childFolder => buildTree(childFolder.id, depth + 1))
       .filter(Boolean);
 
     return {
@@ -340,7 +366,7 @@ export async function isFolderEmpty(folderId, getDesInFolder, logger = null) {
     isEmpty: subfolders.length === 0 && dataExtensions.length === 0,
     subfolderCount: subfolders.length,
     dataExtensionCount: dataExtensions.length,
-    subfolders: subfolders.map(f => ({ id: f.id, name: f.name })),
+    subfolders: subfolders.map(subfolder => ({ id: subfolder.id, name: subfolder.name })),
     dataExtensions: dataExtensions.map(de => ({ customerKey: de.customerKey, name: de.name }))
   };
 }
@@ -349,9 +375,10 @@ export async function isFolderEmpty(folderId, getDesInFolder, logger = null) {
  * Delete a single folder
  * @param {number} folderId - Folder ID to delete
  * @param {object} logger - Logger instance
+ * @param {string} accountId - Business Unit account ID (optional, defaults to config)
  * @returns {Promise<object>} Delete result
  */
-export async function deleteFolder(folderId, logger = null) {
+export async function deleteFolder(folderId, logger = null, accountId = null) {
   const folder = await getFolderById(folderId, logger);
 
   if (!folder) {
@@ -369,7 +396,7 @@ export async function deleteFolder(folderId, logger = null) {
   }
 
   try {
-    const result = await soapDeleteFolder(folderId, logger);
+    const result = await soapDeleteFolder(folderId, logger, accountId);
 
     if (result.success) {
       // Clear cache after successful deletion
@@ -406,7 +433,7 @@ export async function getDeletionOrder(parentId, logger = null) {
     let currentId = folderId;
 
     while (currentId) {
-      const folder = allFolders.find(f => f.id === currentId);
+      const folder = allFolders.find(folder => folder.id === currentId);
       if (!folder || folder.id === parentId) break;
       depth++;
       currentId = folder.parentFolderId;
@@ -416,9 +443,9 @@ export async function getDeletionOrder(parentId, logger = null) {
   };
 
   return allToDelete
-    .map(f => ({
-      ...f,
-      deleteDepth: calculateDepth(f.id)
+    .map(folderToDelete => ({
+      ...folderToDelete,
+      deleteDepth: calculateDepth(folderToDelete.id)
     }))
     .sort((a, b) => b.deleteDepth - a.deleteDepth);
 }
@@ -435,17 +462,37 @@ export async function findSimilarFolders(name, logger = null) {
 
   // Find folders containing the search term
   const matches = allFolders
-    .filter(f => f.name.toLowerCase().includes(searchLower))
-    .map(f => ({
-      name: f.name,
-      path: buildFolderPath(f.id, allFolders)
+    .filter(folder => folder.name.toLowerCase().includes(searchLower))
+    .map(matchedFolder => ({
+      name: matchedFolder.name,
+      path: buildFolderPath(matchedFolder.id, allFolders)
     }))
     .slice(0, 10);
 
   return matches;
 }
 
+/**
+ * Find a folder by path or name (tries path first, then falls back to name)
+ * @param {string} pathOrName - Folder path or name to find
+ * @param {object} logger - Logger instance (optional)
+ * @param {string} accountId - Account ID (optional)
+ * @returns {Promise<object|null>} Folder object or null if not found
+ */
+export async function findFolder(pathOrName, logger = null, accountId = null) {
+  // Try by path first
+  let folder = await getFolderByPath(pathOrName, logger, accountId);
+
+  // Fall back to by name
+  if (!folder) {
+    folder = await getFolderByName(pathOrName, logger, accountId);
+  }
+
+  return folder;
+}
+
 export default {
+  loadAllFolders,
   clearFolderCache,
   getFolderCacheStatus,
   getFolderByPath,
@@ -456,5 +503,6 @@ export default {
   isFolderEmpty,
   deleteFolder,
   getDeletionOrder,
-  findSimilarFolders
+  findSimilarFolders,
+  findFolder
 };

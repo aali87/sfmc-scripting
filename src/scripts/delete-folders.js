@@ -23,17 +23,17 @@ import config, { validateConfig, isFolderProtected } from '../config/index.js';
 import { createLogger, createAuditLogger, createStateManager } from '../lib/logger.js';
 import { testConnection } from '../lib/sfmc-auth.js';
 import {
-  getFolderByPath,
-  getFolderByName,
   getSubfolders,
   getDeletionOrder,
   isFolderEmpty,
   deleteFolder,
   findSimilarFolders,
-  clearFolderCache
+  clearFolderCache,
+  findFolder
 } from '../lib/folder-service.js';
 import { getDataExtensionsInFolder, deleteDataExtension } from '../lib/data-extension-service.js';
 import { sendWebhook } from '../lib/sfmc-rest.js';
+import { sleep } from '../lib/utils.js';
 
 // Parse command line arguments
 const argv = yargs(hideBin(process.argv))
@@ -101,13 +101,6 @@ const argv = yargs(hideBin(process.argv))
 // Initialize logger
 const logger = createLogger('delete-folders');
 const auditLogger = createAuditLogger('delete-folders');
-
-/**
- * Sleep helper
- */
-async function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 /**
  * Print folder deletion preview
@@ -271,7 +264,13 @@ async function runDeletion() {
 
     // Test connection
     const spinner = ora('Connecting to SFMC...').start();
-    const connectionResult = await testConnection(logger);
+    let connectionResult;
+    try {
+      connectionResult = await testConnection(logger);
+    } catch (error) {
+      spinner.fail('Connection failed');
+      throw error;
+    }
 
     if (!connectionResult.success) {
       spinner.fail('Connection failed');
@@ -284,16 +283,23 @@ async function runDeletion() {
     // Handle cache refresh if requested
     if (argv.refreshCache) {
       spinner.start('Clearing cache and fetching fresh data from SFMC...');
-      await clearFolderCache(logger);
-      spinner.succeed('Cache cleared - will fetch fresh data');
+      try {
+        await clearFolderCache(logger);
+        spinner.succeed('Cache cleared - will fetch fresh data');
+      } catch (error) {
+        spinner.fail('Failed to clear cache');
+        throw error;
+      }
     }
 
     // Find target folder
     spinner.start('Finding target folder...');
-    let targetFolder = await getFolderByPath(argv.folder, logger);
-
-    if (!targetFolder) {
-      targetFolder = await getFolderByName(argv.folder, logger);
+    let targetFolder;
+    try {
+      targetFolder = await findFolder(argv.folder, logger);
+    } catch (error) {
+      spinner.fail('Failed to find folder');
+      throw error;
     }
 
     if (!targetFolder) {
@@ -321,26 +327,37 @@ async function runDeletion() {
 
     // Get deletion order (deepest first)
     spinner.start('Building folder deletion order...');
-    const foldersToDelete = await getDeletionOrder(targetFolder.id, logger);
-    spinner.succeed(`Found ${foldersToDelete.length} folder(s) to delete`);
+    let foldersToDelete;
+    try {
+      foldersToDelete = await getDeletionOrder(targetFolder.id, logger);
+      spinner.succeed(`Found ${foldersToDelete.length} folder(s) to delete`);
+    } catch (error) {
+      spinner.fail('Failed to build folder deletion order');
+      throw error;
+    }
 
     // Check if folders are empty
     spinner.start('Checking folder contents...');
     const nonEmptyFolders = [];
 
-    for (const folder of foldersToDelete) {
-      const emptyStatus = await isFolderEmpty(folder.id, getDataExtensionsInFolder, logger);
-      folder.hasContents = !emptyStatus.isEmpty;
-      folder.subfolderCount = emptyStatus.subfolderCount;
-      folder.dataExtensionCount = emptyStatus.dataExtensionCount;
-      folder.contents = emptyStatus;
+    try {
+      for (const folder of foldersToDelete) {
+        const emptyStatus = await isFolderEmpty(folder.id, getDataExtensionsInFolder, logger);
+        folder.hasContents = !emptyStatus.isEmpty;
+        folder.subfolderCount = emptyStatus.subfolderCount;
+        folder.dataExtensionCount = emptyStatus.dataExtensionCount;
+        folder.contents = emptyStatus;
 
-      if (!emptyStatus.isEmpty) {
-        nonEmptyFolders.push(folder);
+        if (!emptyStatus.isEmpty) {
+          nonEmptyFolders.push(folder);
+        }
       }
-    }
 
-    spinner.succeed('Folder contents checked');
+      spinner.succeed('Folder contents checked');
+    } catch (error) {
+      spinner.fail('Failed to check folder contents');
+      throw error;
+    }
 
     // Filter protected folders
     const protectedFolders = foldersToDelete.filter(f => f.isProtected);

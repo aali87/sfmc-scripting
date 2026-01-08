@@ -113,6 +113,37 @@ const config = {
     undo: path.resolve(__dirname, '../../undo')
   },
 
+  // Pagination settings
+  pagination: {
+    defaultPageSize: parseNumber(process.env.DEFAULT_PAGE_SIZE, 500),
+    journeyPageSize: parseNumber(process.env.JOURNEY_PAGE_SIZE, 100),
+    automationDetailsBatchSize: parseNumber(process.env.AUTOMATION_DETAILS_BATCH_SIZE, 10)
+  },
+
+  // Auth Configuration
+  auth: {
+    tokenExpiryBufferMinutes: parseNumber(process.env.TOKEN_EXPIRY_BUFFER_MINUTES, 5)
+  },
+
+  // UI Configuration
+  ui: {
+    consoleWidth: parseNumber(process.env.CONSOLE_WIDTH, 70),
+    maxItemsToDisplay: parseNumber(process.env.MAX_ITEMS_TO_DISPLAY, 20)
+  },
+
+  // API Timeout Settings
+  timeouts: {
+    soapTimeoutMs: parseNumber(process.env.SOAP_TIMEOUT_MS, 120000),      // 2 minutes
+    restTimeoutMs: parseNumber(process.env.REST_TIMEOUT_MS, 60000),       // 1 minute
+    webhookTimeoutMs: parseNumber(process.env.WEBHOOK_TIMEOUT_MS, 10000)  // 10 seconds
+  },
+
+  // Concurrency Settings
+  concurrency: {
+    queryTextConcurrency: parseNumber(process.env.QUERY_TEXT_CONCURRENCY, 25),
+    automationDetailsConcurrency: parseNumber(process.env.AUTOMATION_DETAILS_CONCURRENCY, 10)
+  },
+
   // Version info
   version: '1.0.0'
 };

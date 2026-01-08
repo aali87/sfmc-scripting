@@ -12,6 +12,7 @@
 
 import { loadAllSfmcData, findAutomationsContainingActivity } from './bulk-data-loader.js';
 import dayjs from 'dayjs';
+import { escapeCSV } from './utils.js';
 
 // Default staleness threshold (1 year)
 const DEFAULT_STALE_DAYS = 365;
@@ -61,7 +62,8 @@ export async function analyzeDependencies(dataExtensions, options = {}) {
     staleDays = DEFAULT_STALE_DAYS,
     logger = null,
     onProgress = null,
-    forceRefresh = false
+    forceRefresh = false,
+    accountId = null
   } = options;
 
   const staleThreshold = dayjs().subtract(staleDays, 'day');
@@ -81,7 +83,8 @@ export async function analyzeDependencies(dataExtensions, options = {}) {
       progress(`loading-${stage}`, current, total, message);
     },
     includeAutomationDetails: true,
-    forceRefresh
+    forceRefresh,
+    accountId
   });
 
   progress('loading', 1, 1, 'All metadata loaded');
@@ -220,21 +223,38 @@ function findDependenciesForDe(de, bulkData) {
   const nameLower = de.name ? de.name.toLowerCase() : null;
   const objectIdLower = de.objectId ? de.objectId.toLowerCase() : null;
 
-  // 1. Check Filter Activities (by ObjectID - most accurate)
-  for (const filter of bulkData.filterActivities) {
+  // Check each dependency type using helper functions
+  findFilterDependencies(bulkData.filterActivities, objectIdLower, dependencies);
+  findQueryDependencies(bulkData.queryActivities, keyLower, nameLower, dependencies);
+  findImportDependencies(bulkData.importActivities, keyLower, nameLower, dependencies);
+  findTriggeredSendDependencies(bulkData.triggeredSends, keyLower, dependencies);
+  findAutomationDependencies(bulkData.automations, keyLower, dependencies);
+  findJourneyDependencies(bulkData.journeys, keyLower, dependencies);
+  findDataExtractDependencies(bulkData.dataExtracts, keyLower, nameLower, dependencies);
+
+  return dependencies;
+}
+
+/**
+ * Find Filter Activity dependencies for a DE
+ * @param {object[]} filterActivities - Filter activities to check
+ * @param {string|null} objectIdLower - DE ObjectID (lowercase)
+ * @param {object[]} dependencies - Array to push found dependencies to
+ */
+function findFilterDependencies(filterActivities, objectIdLower, dependencies) {
+  if (!objectIdLower) return;
+
+  for (const filter of filterActivities) {
     let isMatch = false;
     let matchType = '';
 
-    // Primary: Check sourceObjectId and destinationObjectId
-    if (objectIdLower) {
-      if (filter.sourceObjectId && filter.sourceObjectId.toLowerCase() === objectIdLower) {
-        isMatch = true;
-        matchType = 'Source DE';
-      }
-      if (filter.destinationObjectId && filter.destinationObjectId.toLowerCase() === objectIdLower) {
-        isMatch = true;
-        matchType = matchType ? 'Source & Destination DE' : 'Destination DE';
-      }
+    if (filter.sourceObjectId && filter.sourceObjectId.toLowerCase() === objectIdLower) {
+      isMatch = true;
+      matchType = 'Source DE';
+    }
+    if (filter.destinationObjectId && filter.destinationObjectId.toLowerCase() === objectIdLower) {
+      isMatch = true;
+      matchType = matchType ? 'Source & Destination DE' : 'Destination DE';
     }
 
     if (isMatch) {
@@ -255,27 +275,37 @@ function findDependenciesForDe(de, bulkData) {
       });
     }
   }
+}
 
-  // 2. Check Query Activities (by CustomerKey/Name in target or SQL)
-  for (const query of bulkData.queryActivities) {
+/**
+ * Find Query Activity dependencies for a DE
+ * @param {object[]} queryActivities - Query activities to check
+ * @param {string} keyLower - DE CustomerKey (lowercase)
+ * @param {string|null} nameLower - DE Name (lowercase)
+ * @param {object[]} dependencies - Array to push found dependencies to
+ */
+function findQueryDependencies(queryActivities, keyLower, nameLower, dependencies) {
+  for (const query of queryActivities) {
     const targetKey = query['DataExtensionTarget.CustomerKey'] || query.DataExtensionTarget?.CustomerKey;
     const targetName = query['DataExtensionTarget.Name'] || query.DataExtensionTarget?.Name;
+
+    const targetKeyStr = typeof targetKey === 'string' ? targetKey : null;
+    const targetNameStr = typeof targetName === 'string' ? targetName : null;
 
     let isMatch = false;
     let matchDetails = [];
 
     // Check if this DE is the query target
-    if (targetKey?.toLowerCase() === keyLower || targetName?.toLowerCase() === keyLower) {
+    if (targetKeyStr?.toLowerCase() === keyLower || targetNameStr?.toLowerCase() === keyLower) {
       isMatch = true;
       matchDetails.push('Query Target');
     }
-    if (nameLower && targetName?.toLowerCase() === nameLower) {
+    if (nameLower && targetNameStr?.toLowerCase() === nameLower) {
       isMatch = true;
       if (!matchDetails.includes('Query Target')) matchDetails.push('Query Target');
     }
 
-    // Check SQL for DE reference (by CustomerKey or Name)
-    // SQL typically uses DE Name like: FROM [DE_Name] or JOIN [DE_Name]
+    // Check SQL for DE reference
     if (query.QueryText) {
       const sqlLower = query.QueryText.toLowerCase();
       if (sqlLower.includes(keyLower)) {
@@ -305,12 +335,32 @@ function findDependenciesForDe(de, bulkData) {
       });
     }
   }
+}
 
-  // 3. Check Import Activities
-  for (const imp of bulkData.importActivities) {
+/**
+ * Find Import Activity dependencies for a DE
+ * @param {object[]} importActivities - Import activities to check
+ * @param {string} keyLower - DE CustomerKey (lowercase)
+ * @param {string|null} nameLower - DE Name (lowercase)
+ * @param {object[]} dependencies - Array to push found dependencies to
+ */
+function findImportDependencies(importActivities, keyLower, nameLower, dependencies) {
+  for (const imp of importActivities) {
     const destKey = imp['DestinationObject.CustomerKey'] || imp.DestinationObject?.CustomerKey;
+    const destName = imp['DestinationObject.Name'] || imp.DestinationObject?.Name;
 
-    if (destKey?.toLowerCase() === keyLower) {
+    const destKeyStr = typeof destKey === 'string' ? destKey : null;
+    const destNameStr = typeof destName === 'string' ? destName : null;
+
+    let isMatch = false;
+    if (destKeyStr?.toLowerCase() === keyLower) {
+      isMatch = true;
+    }
+    if (nameLower && destNameStr?.toLowerCase() === nameLower) {
+      isMatch = true;
+    }
+
+    if (isMatch) {
       dependencies.push({
         type: 'Import Activity',
         id: imp.ObjectID,
@@ -320,15 +370,24 @@ function findDependenciesForDe(de, bulkData) {
         rawData: {
           objectId: imp.ObjectID,
           customerKey: imp.CustomerKey,
+          destinationDeKey: destKey,
+          destinationDeName: destName,
           createdDate: imp.CreatedDate,
           modifiedDate: imp.ModifiedDate
         }
       });
     }
   }
+}
 
-  // 4. Check Triggered Sends
-  for (const tsd of bulkData.triggeredSends) {
+/**
+ * Find Triggered Send dependencies for a DE
+ * @param {object[]} triggeredSends - Triggered sends to check
+ * @param {string} keyLower - DE CustomerKey (lowercase)
+ * @param {object[]} dependencies - Array to push found dependencies to
+ */
+function findTriggeredSendDependencies(triggeredSends, keyLower, dependencies) {
+  for (const tsd of triggeredSends) {
     const objString = JSON.stringify(tsd).toLowerCase();
     if (objString.includes(keyLower)) {
       dependencies.push({
@@ -345,32 +404,46 @@ function findDependenciesForDe(de, bulkData) {
       });
     }
   }
+}
 
-  // 5. Check Automations (search in steps for DE reference)
-  for (const auto of bulkData.automations) {
-    const autoJson = JSON.stringify(auto).toLowerCase();
-    if (autoJson.includes(keyLower)) {
+/**
+ * Find Automation dependencies for a DE
+ * @param {object[]} automations - Automations to check
+ * @param {string} keyLower - DE CustomerKey (lowercase)
+ * @param {object[]} dependencies - Array to push found dependencies to
+ */
+function findAutomationDependencies(automations, keyLower, dependencies) {
+  for (const automation of automations) {
+    const automationJson = JSON.stringify(automation).toLowerCase();
+    if (automationJson.includes(keyLower)) {
       dependencies.push({
         type: 'Automation',
-        id: auto.id,
-        name: auto.name,
-        status: auto.status,
+        id: automation.id,
+        name: automation.name,
+        status: automation.status,
         details: 'Referenced in Automation',
         rawData: {
-          id: auto.id,
-          key: auto.key,
-          status: auto.status,
-          statusId: auto.statusId,
-          lastRunTime: auto.lastRunTime,
-          createdDate: auto.createdDate,
-          modifiedDate: auto.modifiedDate
+          id: automation.id,
+          key: automation.key,
+          status: automation.status,
+          statusId: automation.statusId,
+          lastRunTime: automation.lastRunTime,
+          createdDate: automation.createdDate,
+          modifiedDate: automation.modifiedDate
         }
       });
     }
   }
+}
 
-  // 6. Check Journeys
-  for (const journey of bulkData.journeys) {
+/**
+ * Find Journey dependencies for a DE
+ * @param {object[]} journeys - Journeys to check
+ * @param {string} keyLower - DE CustomerKey (lowercase)
+ * @param {object[]} dependencies - Array to push found dependencies to
+ */
+function findJourneyDependencies(journeys, keyLower, dependencies) {
+  for (const journey of journeys) {
     const journeyJson = JSON.stringify(journey).toLowerCase();
     if (journeyJson.includes(keyLower)) {
       dependencies.push({
@@ -388,23 +461,55 @@ function findDependenciesForDe(de, bulkData) {
       });
     }
   }
+}
 
-  // 7. Check Data Extracts
-  for (const extract of bulkData.dataExtracts) {
-    const extractJson = JSON.stringify(extract).toLowerCase();
-    if (extractJson.includes(keyLower)) {
+/**
+ * Find Data Extract dependencies for a DE
+ * @param {object[]} dataExtracts - Data extracts to check
+ * @param {string} keyLower - DE CustomerKey (lowercase)
+ * @param {string|null} nameLower - DE Name (lowercase)
+ * @param {object[]} dependencies - Array to push found dependencies to
+ */
+function findDataExtractDependencies(dataExtracts, keyLower, nameLower, dependencies) {
+  for (const extract of dataExtracts) {
+    let isMatch = false;
+    let matchDetails = [];
+
+    const extractDeKey = extract.dataExtensionCustomerKey || extract.dataFields?.dataExtensionCustomerKey;
+    const extractDeName = extract.dataExtensionName || extract.dataFields?.dataExtensionName;
+
+    const extractDeKeyStr = typeof extractDeKey === 'string' ? extractDeKey : null;
+    const extractDeNameStr = typeof extractDeName === 'string' ? extractDeName : null;
+
+    if (extractDeKeyStr?.toLowerCase() === keyLower) {
+      isMatch = true;
+      matchDetails.push('Extract Source/Target');
+    }
+    if (nameLower && extractDeNameStr?.toLowerCase() === nameLower) {
+      isMatch = true;
+      if (!matchDetails.includes('Extract Source/Target')) matchDetails.push('Extract Source/Target');
+    }
+
+    // Fall back to JSON search for other references
+    if (!isMatch) {
+      const extractJson = JSON.stringify(extract).toLowerCase();
+      if (extractJson.includes(keyLower)) {
+        isMatch = true;
+        matchDetails.push('Referenced in Data Extract config');
+      }
+    }
+
+    if (isMatch) {
       dependencies.push({
         type: 'Data Extract',
         id: extract.dataExtractDefinitionId || extract.id,
         name: extract.name,
         status: extract.status,
-        details: 'Referenced in Data Extract',
+        details: matchDetails.join(', ') || 'Referenced in Data Extract',
         rawData: extract
       });
     }
   }
-
-  return dependencies;
 }
 
 /**
@@ -480,20 +585,20 @@ function classifyDependency(dep, bulkData, staleThreshold) {
  * Classify an automation dependency
  */
 function classifyAutomation(enriched, bulkData, staleThreshold) {
-  const autoData = enriched.rawData || {};
-  const auto = bulkData.automationsById.get(enriched.id) || autoData;
+  const automationData = enriched.rawData || {};
+  const automation = bulkData.automationsById.get(enriched.id) || automationData;
 
   enriched.metadata = {
-    status: auto.status,
-    statusId: auto.statusId,
-    lastRunTime: auto.lastRunTime,
-    createdDate: auto.createdDate,
-    modifiedDate: auto.modifiedDate
+    status: automation.status,
+    statusId: automation.statusId,
+    lastRunTime: automation.lastRunTime,
+    createdDate: automation.createdDate,
+    modifiedDate: automation.modifiedDate
   };
 
-  const lastRun = auto.lastRunTime ? dayjs(auto.lastRunTime) : null;
-  const status = (auto.status || '').toLowerCase();
-  const statusId = auto.statusId;
+  const lastRun = automation.lastRunTime ? dayjs(automation.lastRunTime) : null;
+  const status = (automation.status || '').toLowerCase();
+  const statusId = automation.statusId;
 
   // Status codes: 1=Building, 2=Ready, 3=Running, 4=Paused, 5=Stopped, 6=Scheduled, 7=Awaiting, 8=Inactive
   const isInactive = statusId === 4 || statusId === 5 || statusId === 8 ||
@@ -574,10 +679,10 @@ function classifyFilter(enriched, bulkData, staleThreshold) {
     let allAutomationsSafe = true;
     let activeRecentAutomations = [];
 
-    for (const auto of automationsUsingFilter) {
-      const lastRun = auto.lastRunTime ? dayjs(auto.lastRunTime) : null;
-      const status = (auto.status || '').toLowerCase();
-      const statusId = auto.statusId;
+    for (const automation of automationsUsingFilter) {
+      const lastRun = automation.lastRunTime ? dayjs(automation.lastRunTime) : null;
+      const status = (automation.status || '').toLowerCase();
+      const statusId = automation.statusId;
 
       // Check if explicitly inactive
       const isInactive = statusId === 4 || statusId === 5 || statusId === 8 ||
@@ -591,7 +696,7 @@ function classifyFilter(enriched, bulkData, staleThreshold) {
 
       if (!isSafe) {
         allAutomationsSafe = false;
-        activeRecentAutomations.push(auto.name);
+        activeRecentAutomations.push(automation.name);
       }
     }
 
@@ -683,8 +788,8 @@ export function formatAnalysisReport(report) {
       const reason = `   └ ${dep.classificationReason}`;
       lines.push(`│${reason.substring(0, width).padEnd(width)}│`);
 
-      if (dep.metadata.lastRunTime) {
-        const lastRun = `     Last run: ${dep.metadata.lastRunTime.split('T')[0]} (${dep.metadata.daysSinceLastRun} days ago)`;
+      if (dep.metadata?.lastRunTime) {
+        const lastRun = `     Last run: ${dep.metadata.lastRunTime.split('T')[0]} (${dep.metadata?.daysSinceLastRun} days ago)`;
         lines.push(`│${lastRun.substring(0, width).padEnd(width)}│`);
       }
 
@@ -713,12 +818,12 @@ export function formatAnalysisReport(report) {
       const reason = `   └ ${dep.classificationReason}`;
       lines.push(`│${reason.substring(0, width).padEnd(width)}│`);
 
-      if (dep.metadata.lastRunTime) {
-        const lastRun = `     Last run: ${dep.metadata.lastRunTime.split('T')[0]} (${dep.metadata.daysSinceLastRun || '?'} days ago)`;
+      if (dep.metadata?.lastRunTime) {
+        const lastRun = `     Last run: ${dep.metadata.lastRunTime.split('T')[0]} (${dep.metadata?.daysSinceLastRun || '?'} days ago)`;
         lines.push(`│${lastRun.substring(0, width).padEnd(width)}│`);
       }
 
-      if (dep.metadata.usedInAutomations && dep.metadata.usedInAutomations.length > 0) {
+      if (dep.metadata?.usedInAutomations && dep.metadata.usedInAutomations.length > 0) {
         const autoNames = dep.metadata.usedInAutomations.map(a => a.name).slice(0, 2);
         const autoStr = `     Used in: ${autoNames.join(', ')}${dep.metadata.usedInAutomations.length > 2 ? ' +more' : ''}`;
         lines.push(`│${autoStr.substring(0, width).padEnd(width)}│`);
@@ -749,16 +854,6 @@ export function formatAnalysisReport(report) {
  */
 export function exportReportToCsv(report, options = {}) {
   const { includeAffectedDes = true } = options;
-
-  // Escape CSV values
-  const escapeCSV = (val) => {
-    if (val === null || val === undefined) return '';
-    const str = String(val);
-    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
-      return `"${str.replace(/"/g, '""')}"`;
-    }
-    return str;
-  };
 
   // CSV header
   const headers = [
@@ -822,14 +917,6 @@ export function exportReportToCsv(report, options = {}) {
  * @returns {string} CSV content
  */
 export function exportDeDependenciesToCsv(dataExtensions, report) {
-  const escapeCSV = (val) => {
-    if (val === null || val === undefined) return '';
-    const str = String(val);
-    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
-      return `"${str.replace(/"/g, '""')}"`;
-    }
-    return str;
-  };
 
   const headers = [
     'DE Name',
